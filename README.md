@@ -5,35 +5,10 @@ installation is a self-contained node: identity, messages, and sync state stay
 on the device. There is no server, account, or Internet requirement. The full
 product/protocol specification lives in [`plan.md`](./plan.md).
 
-## Status: Phases 0–1 verified; Phase 2 hardware gate blocked
+## Overview
 
-Implemented so far:
-
-- **`crates/blendr-config`** — typed parser and strict validator for the
-  single `config.json` schema (plan §4): unknown keys rejected, jump counts
-  limited to integral `0..=5` without silent clamping, security/feature
-  suites checked against the supported v1 set, UUIDs validated, relative
-  paths resolved against the config file's directory, and atomic
-  temp-file+rename saves.
-- **`crates/blendr-identity`** — Blendr Identity System (BIS): Ed25519 signing
-  key, stable 52-character BID (`BASE32_NOPAD(SHA-256("blendr:identity:v1" ||
-  pubkey))`), signed canonical-CBOR identity documents with monotonic
-  versions, X25519 encryption-key epochs, and an encrypted keystore
-  (Argon2id + XChaCha20-Poly1305, owner-only `0600` file, atomic updates,
-  never overwrites an existing file).
-- **`crates/blendr-storage`** — SQLite persistence (bundled via rusqlite):
-  schema migrations gated on `application_id`, single-owner local identity
-  with monotonic document versions, signed `profile_versions` history, and
-  private local messages. Unsafe paths (symlinks, non-regular files, foreign
-  databases) are refused; new databases are created `0600`.
-- **`apps/linux-cli`** — the `blendr` binary (clap) with the local workflow:
-  `doctor`, `init`, `identity show|rename|export|import`, `note`, `inbox`.
-- **`crates/blendr-transport`** — shared bounded `BLENDR/1` fragmentation,
-  cancellation, timeout recovery, and an in-memory radio with loss, delay,
-  disconnection, range changes, bounded queues, and connection election.
-- **`crates/blendr-bluez`** — BlueZ service-only advertising, filtered scanning,
-  GATT client/server packet IO, runtime packet MTU, retries, and clean shutdown.
-  These are exposed through library APIs and diagnostic examples, not chat.
+The Rust workspace provides a Linux CLI for decentralized identities and private
+local notes, plus shared framing, an in-memory radio, and a BlueZ BLE adapter.
 
 Not implemented yet: the `blendr start` node application, peers UI, secure
 sessions, messaging between nodes, mesh, sync, or Android. Private notes are
@@ -141,34 +116,12 @@ resolve relative to the JSON file's directory, not the process working
 directory. Secrets never live in JSON: private keys exist only inside the
 encrypted keystore.
 
-## Verified local workflows
-
-Formatting, clippy with warnings denied, and 81 workspace tests pass. CLI
-smoke runs exercised separate installations, idempotent initialization,
-restart-persistent searchable notes, stable BID after rename, encrypted
-backup/restore, wrong-passphrase and overwrite rejection, owner-only files,
-and recovery from an older same-BID backup without losing local history.
-These checks do not establish cross-device BLE interoperability.
-
-## Transport diagnostics and hardware gate
+## Transport diagnostics
 
 ```sh
 cargo run --locked -p blendr-transport --example memory_smoke
 cargo run --locked -p blendr-bluez --example probe -- config.json --duration 5
 ```
-
-The memory smoke exchanged five exact frames in both directions over 20-byte
-packets, observed range-loss disconnection, and reconnected cleanly. The real
-probe registered GATT and advertised the service on `hci0` with BlueZ 5.87.
-D-Bus observation confirmed simultaneous scanning and advertising on this
-controller; shutdown restored scanning-off and zero active advertisements.
-No Blendr peer was discovered.
-
-**Phase 2 remains blocked:** only one Linux controller is accessible, with no
-second Linux host configured and no Android device attached. Two-device
-discovery, bidirectional fragmented GATT transfer, actual negotiated peer MTUs,
-connection election, and the second controller's scheduling behavior remain
-unverified. Phase 3 and later gates have not been started.
 
 On two available Linux hosts, run the probe with `--spike --duration 30` on
 both to exercise fixed diagnostic-frame exchange. This is not secure chat.
