@@ -1,0 +1,16 @@
+[package]
+name = "blendr-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Blendr transport traits, BLENDR/1 packet framing, and the fault-injectable in-memory BLE adapter"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
