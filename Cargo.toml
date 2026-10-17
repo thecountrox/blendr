@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "crates/blendr-config",
+    "crates/blendr-identity",
 ]
 resolver = "3"
