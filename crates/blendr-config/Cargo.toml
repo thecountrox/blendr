@@ -1,0 +1,12 @@
+[package]
+name = "blendr-config"
+version = "0.1.0"
+edition = "2024"
+description = "blendr configuration schema, validation, path resolution, and atomic saves"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+thiserror = "2"
