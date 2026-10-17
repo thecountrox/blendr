@@ -123,3 +123,23 @@ debug start/end output, truthful zero-peer reporting, no MAC output, and cleanup
 Disabled-advertising startup exited 1 after cleanup without a false watching
 status. New diagnostic logs from both user devices are still needed to
 distinguish actual radio/controller behavior from candidate rejection.
+
+## Paired hardware diagnostic access attempt
+
+The user authorized SSH to the Pi and supplied its repository location.
+The session host was at revision `dd4fab2`. Local doctor prerequisites and
+all 89 workspace tests passed. A fresh 20-second real BlueZ probe registered
+GATT, advertised the service, completed two scan windows, and shut down cleanly.
+It reported zero Blendr peers; cached candidates failed service/RSSI admission.
+
+Remote access did not reach authentication: the supplied multicast hostname
+failed DNS and multicast resolution, and SSH to the supplied LAN fallback
+failed with no route to host and failed neighbour resolution. A previously
+known overlay hostname also failed resolution and had no current peer entry.
+No private keys were read or changed, and no Pi source/configuration was changed.
+
+Synchronized discovery, Pi prerequisites/revision inspection, and fragmented
+transfers in either direction could not be run. Raw HCI capture was not run;
+passwordless sudo was unavailable locally. These are access limitations, not
+proof that either BLE controller failed. Resume when the Pi is reachable from
+the actual session host; confirm physical BLE proximity independently of SSH.
