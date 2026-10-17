@@ -45,7 +45,7 @@ features for implemented behavior.
 ## Verification evidence
 
 The last complete local verification passed formatting, clippy with warnings
-denied, all-target builds, and 81 workspace tests:
+denied, all-target builds, and 83 workspace tests:
 
 ```sh
 cargo fmt --all --check
@@ -83,3 +83,17 @@ complete based solely on the memory transport or the one-controller probe.
 The implementation stopped at this hardware gate; later phases were not started.
 When hardware access is available, resume with the Phase 2 acceptance criteria in
 `plan.md` before claiming that phase complete.
+
+## Doctor controller enumeration regression
+
+A user testing an Arch laptop against a Raspberry Pi reported that `doctor`
+counted `/sys/class/bluetooth/hci0:256` as a second controller, then issued
+invalid D-Bus introspection requests for `/org/bluez/hci0:256`. Controller
+enumeration now accepts only `hci` followed by one or more ASCII digits in
+both sysfs and BlueZ object-path parsing; connection entries are not controllers.
+
+Two regression tests cover numbered controllers, connection entries, invalid
+suffixes, and nested BlueZ device paths. Both tests and all 83 workspace tests
+passed, clippy passed with warnings denied, and a local `doctor` smoke returned
+one controller and passed prerequisites. The user's laptop and Pi have not been
+remotely verified; their cross-device acceptance results remain pending.

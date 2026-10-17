@@ -657,13 +657,19 @@ fn adapter_roles(tools: &Tools, adapter: &str, single_adapter: bool) -> Option<S
 // Adapter enumeration helpers
 // ---------------------------------------------------------------------------
 
-/// Kernel-visible controllers: /sys/class/bluetooth/hci* entries.
+/// Controller names exclude HCI connection entries such as `hci0:256`.
+fn is_adapter_name(name: &str) -> bool {
+    name.strip_prefix("hci")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Kernel-visible controllers: only `/sys/class/bluetooth/hciN` entries.
 fn sysfs_adapters() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/bluetooth") {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str()
-                && name.starts_with("hci")
+                && is_adapter_name(name)
             {
                 out.push(name.to_owned());
             }
@@ -700,12 +706,9 @@ fn parse_adapter_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in text.split(['"', ' ', '\t', '\n']) {
         if let Some(rest) = token.strip_prefix("/org/bluez/") {
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if name.starts_with("hci") && !name.contains('/') {
-                out.push(name);
+            let name = rest.split('/').next().unwrap_or_default();
+            if is_adapter_name(name) {
+                out.push(name.to_owned());
             }
         }
     }
@@ -973,5 +976,35 @@ fn summarize(probe: &Probe) -> String {
                 .unwrap_or("no output");
             format!("exit {}: {}", out.status, detail.trim())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_adapter_name, parse_adapter_paths};
+
+    #[test]
+    fn only_numbered_hci_controllers_are_adapters() {
+        for controller in ["hci0", "hci1", "hci12", "hci256"] {
+            assert!(is_adapter_name(controller), "{controller}");
+        }
+        for other in [
+            "hci0:256",
+            "hci1:512",
+            "hci",
+            "hci-1",
+            "hci0_extra",
+            "hci０",
+            "hci0/device",
+            "rfkill0",
+        ] {
+            assert!(!is_adapter_name(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn bluez_paths_reject_connection_entries_without_truncating_them() {
+        let objects = r#""/org/bluez/hci0" "/org/bluez/hci12/dev_00_11_22_33_44_55" "/org/bluez/hci0:256" "/org/bluez/hci1_extra" "/org/bluez/hci""#;
+        assert_eq!(parse_adapter_paths(objects), ["hci0", "hci12"]);
     }
 }
