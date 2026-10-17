@@ -1,0 +1,21 @@
+[package]
+name = "blendr-bluez"
+version = "0.1.0"
+edition = "2024"
+description = "Blendr Linux BLE transport adapter on BlueZ via bluer (advertise, scan, GATT server/client)"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+blendr-config = { path = "../blendr-config" }
+blendr-transport = { path = "../blendr-transport" }
+bluer = { version = "0.17.4", features = ["bluetoothd"] }
+futures = "0.3"
+log = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
