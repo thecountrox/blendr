@@ -35,10 +35,15 @@ use bluer::gatt::local::{
 use bluer::gatt::{CharacteristicReader, CharacteristicWriter};
 use bluer::{Adapter, AdapterEvent, Address, Device, DiscoveryFilter, DiscoveryTransport, Session};
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+mod discovery;
+
+use discovery::SeenQueue;
 
 use blendr_transport::{
     BleTransport, FramedLink, LinkConfig, LinkRole, PacketIo, PeerEvent, PeerLink, PeerLocator,
@@ -58,6 +63,9 @@ const PENDING_HALVES_MAX: usize = 8;
 const PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 /// Upper bound for the peer-aging sweeper tick.
 const SWEEP_MAX: Duration = Duration::from_secs(30);
+
+/// Maximum concurrent per-device property evaluations during a scan cycle.
+const SEEN_EVAL_CONCURRENCY: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -1225,70 +1233,189 @@ fn expire_pending(pending: &mut HashMap<Address, PendingHalf>) {
 /// Explicit transitions: each cycle sets the discovery filter, starts a
 /// bounded discovery window, then stops scanning for the remainder of the
 /// configured interval so scanning and advertising share airtime
-/// predictably.
+/// predictably. Filter setup and discovery startup are bounded by the
+/// cycle deadline so a stuck D-Bus call can never stall the task past its
+/// cycle.
+///
+/// `discover_devices_with_changes` replays every device object BlueZ has
+/// cached — including devices not currently in range — before streaming
+/// live events. Evaluating a sighting costs two D-Bus property reads
+/// (`UUIDs`, `RSSI`); awaiting them inline serializes the cache flood
+/// ahead of real advertisements and can starve the whole window.
+/// Sightings are deduplicated into [`SeenQueue`] and evaluated with
+/// bounded concurrency ([`SEEN_EVAL_CONCURRENCY`]) through a single
+/// named future type, so `evals` never mixes distinct async-block types.
+/// A sighting queued while its address is already under evaluation stays
+/// queued and is re-evaluated after that evaluation finishes — never
+/// evaluated twice concurrently. `DeviceRemoved` drops the pending
+/// sighting, cancels a live evaluation, and the cancelled evaluation
+/// cannot register or announce the peer when it wakes. Evaluations keep
+/// running through the off part of the cycle and are cancelled at the
+/// cycle deadline; any sighting still unevaluated is retried next cycle —
+/// either carried in `queued` or replayed as a cached `DeviceAdded`.
 async fn scan_task(inner: Arc<Inner>) {
     let cancel = inner.shutdown_token.clone();
     let window = inner.settings.scan_window;
     let interval = inner.settings.scan_interval;
     let service = inner.settings.scan_service_uuid;
+    let mut queued = SeenQueue::default();
 
     loop {
-        // Explicit scan start.
+        let cycle_deadline = tokio::time::Instant::now() + interval;
+        // Cycle boundary markers let a debug capture distinguish a stuck
+        // filter/startup call from a window that saw no events.
+        log::debug!("blendr-bluez: scan cycle start");
+
+        // Stage the filter in the session's filter map. Failing here means
+        // the next StartDiscovery would send a stale or empty (match-any)
+        // filter, flooding the window with every in-range device — so skip
+        // the cycle instead of scanning unfiltered.
         let filter = DiscoveryFilter {
             uuids: [service].into_iter().collect(),
             transport: DiscoveryTransport::Le,
             ..Default::default()
         };
-        if let Err(e) = inner.adapter.set_discovery_filter(filter).await {
-            log::warn!(
-                "blendr-bluez: set discovery filter failed: {}",
-                scrub_addrs(&e.to_string())
-            );
-        }
+        match with_cancel_timeout(
+            &cancel,
+            cycle_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            "set discovery filter",
+            inner.adapter.set_discovery_filter(filter),
+        )
+        .await
         {
-            let stream = match inner.adapter.discover_devices_with_changes().await {
+            Ok(()) => {}
+            Err(TransportError::Cancelled) => return,
+            Err(e) => {
+                log::warn!("blendr-bluez: {e}");
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep_until(cycle_deadline) => continue,
+                }
+            }
+        }
+
+        let mut evals = FuturesUnordered::new();
+        let mut active: HashMap<Address, CancellationToken> = HashMap::new();
+        {
+            // Scan window: consume adapter events until the deadline. The
+            // drain only pushes onto `queued`; property reads run in
+            // `evals` so a large cached-device replay cannot block
+            // real-time events.
+            let stream = match with_cancel_timeout(
+                &cancel,
+                cycle_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                "start discovery",
+                inner.adapter.discover_devices_with_changes(),
+            )
+            .await
+            {
                 Ok(s) => s,
+                Err(TransportError::Cancelled) => return,
                 Err(e) => {
-                    log::warn!(
-                        "blendr-bluez: start discovery failed: {}",
-                        scrub_addrs(&e.to_string())
-                    );
+                    log::warn!("blendr-bluez: {e}");
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(interval) => continue,
+                        _ = tokio::time::sleep_until(cycle_deadline) => continue,
                     }
                 }
             };
             tokio::pin!(stream);
-
-            // Scan window: consume adapter events until the deadline.
             let window_deadline = tokio::time::Instant::now() + window;
+            log::debug!("blendr-bluez: scan window start");
             loop {
+                // Start evaluations only for queued addresses not already
+                // under evaluation; re-sightings stay queued for
+                // reevaluation once the in-flight one completes.
+                while evals.len() < SEEN_EVAL_CONCURRENCY
+                    && let Some(addr) = queued.pop_ready(|a| !active.contains_key(a))
+                {
+                    let token = CancellationToken::new();
+                    active.insert(addr, token.clone());
+                    evals.push(eval_seen(inner.clone(), addr, token));
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep_until(window_deadline) => break,
                     evt = stream.next() => {
                         match evt {
-                            Some(AdapterEvent::DeviceAdded(addr)) => {
-                                handle_seen(&inner, addr).await;
-                            }
+                            Some(AdapterEvent::DeviceAdded(addr)) => queued.push(addr),
                             Some(AdapterEvent::DeviceRemoved(addr)) => {
+                                // Drop pending re-sightings and cancel any
+                                // live evaluation before unregistering the
+                                // peer; its waking future checks the token
+                                // and must not recreate it.
+                                queued.remove(addr);
+                                if let Some(token) = active.get(&addr) {
+                                    token.cancel();
+                                }
                                 handle_removed(&inner, addr);
                             }
                             Some(AdapterEvent::PropertyChanged(_)) => {}
                             None => break,
                         }
                     }
+                    done = evals.next(), if !evals.is_empty() => {
+                        if let Some(addr) = done {
+                            active.remove(&addr);
+                        }
+                    }
                 }
             }
-            // End the scope to drop the owned stream, not only its pinned reference.
+            log::debug!("blendr-bluez: scan window end");
+            // End the scope to drop the owned stream (StopDiscovery), not
+            // only its pinned reference.
         }
+
+        // Off part of the cycle: finish pending evaluations without
+        // scanning, bounded by the cycle deadline.
+        loop {
+            while evals.len() < SEEN_EVAL_CONCURRENCY
+                && let Some(addr) = queued.pop_ready(|a| !active.contains_key(a))
+            {
+                let token = CancellationToken::new();
+                active.insert(addr, token.clone());
+                evals.push(eval_seen(inner.clone(), addr, token));
+            }
+            if evals.is_empty() {
+                break;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep_until(cycle_deadline) => break,
+                done = evals.next() => {
+                    if let Some(addr) = done {
+                        active.remove(&addr);
+                    }
+                }
+            }
+        }
+        drop(evals);
 
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(interval.saturating_sub(window)) => {}
+            _ = tokio::time::sleep_until(cycle_deadline) => {}
         }
+        log::debug!("blendr-bluez: scan cycle end");
     }
+}
+
+/// Run one queued sighting's evaluation under per-candidate cancellation.
+///
+/// Every entry pushed into `evals` is this single future type. The token
+/// exists so `DeviceRemoved` can stop a live evaluation of the removed
+/// address: a cancelled future skips `handle_seen` entirely, and a
+/// cancelled future can never register or announce the removed peer on
+/// wake. Returns the evaluated address so the caller drops the matching
+/// entry in `active` — keeping the entry keyed until completion prevents
+/// a re-sighting from spawning a parallel duplicate evaluation.
+async fn eval_seen(inner: Arc<Inner>, addr: Address, token: CancellationToken) -> Address {
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => {}
+        _ = inner.shutdown_token.cancelled() => {}
+        _ = handle_seen(&inner, addr) => {}
+    }
+    addr
 }
 
 /// Admit a discovered device if it advertises the service UUID and is
@@ -1298,9 +1425,12 @@ async fn handle_seen(inner: &Arc<Inner>, addr: Address) {
         Ok(d) => d,
         Err(_) => return,
     };
-    let matches_service = matches!(device.uuids().await, Ok(Some(u)) if u.contains(&inner.settings.scan_service_uuid));
-    let in_range = matches!(device.rssi().await, Ok(Some(_)));
-    if !matches_service || !in_range {
+    let service_match = matches!(device.uuids().await, Ok(Some(u)) if u.contains(&inner.settings.scan_service_uuid));
+    let live_rssi = matches!(device.rssi().await, Ok(Some(_)));
+    // Admission booleans only — no identifiers — so a debug capture can
+    // tell "device seen but rejected" apart from "no events at all".
+    log::debug!("blendr-bluez: scan candidate service_match={service_match} live_rssi={live_rssi}");
+    if !service_match || !live_rssi {
         return;
     }
     let mut peers = inner.peers.lock().unwrap_or_else(|e| e.into_inner());

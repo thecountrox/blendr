@@ -12,8 +12,8 @@ features for implemented behavior.
   atomic settings writes, doctor diagnostics, and CI.
 - Phase 1: implemented and verified — decentralized identity, encrypted keystore,
   SQLite persistence, and local CLI workflows.
-- Phase 2: transport software implemented; two-device hardware acceptance remains
-  unverified and blocked by unavailable second-device access.
+- Phase 2: transport software implemented; two-device hardware acceptance is
+  pending. User Pi/Arch trials exposed intermittent, asymmetric discovery.
 - Phases 3–8: not implemented. Secure sessions, HPKE addressed messaging, broadcast
   sync, mesh forwarding, Android interoperability, and protocol freeze are pending.
   No Kotlin/Compose app, Android BLE adapter, JNI bridge, or Android Keystore
@@ -45,7 +45,7 @@ features for implemented behavior.
 ## Verification evidence
 
 The last complete local verification passed formatting, clippy with warnings
-denied, all-target builds, and 83 workspace tests:
+denied, all-target builds, and 89 workspace tests:
 
 ```sh
 cargo fmt --all --check
@@ -71,18 +71,17 @@ cross-device BLE interoperability or secure messaging.
 Rust language-server diagnostics were unavailable in the implementation session;
 compiler, clippy, test, and runtime evidence are the available verification.
 
-## Hardware acceptance blocker
+## Hardware acceptance status
 
-Only one Linux controller was accessible in the implementation environment. No
-second Linux host was configured and no Android device was attached. Phase 2
-still requires two-device discovery, bidirectional fragmented GATT transfer,
-actual negotiated peer MTUs, connection election, and verification of the second
-controller's scheduling behavior. These acceptance criteria must not be marked
-complete based solely on the memory transport or the one-controller probe.
+The agent environment exposes only one Linux controller. The user is now testing
+a Raspberry Pi and an Arch Linux laptop on separate machines, but those machines
+are not remotely accessible to the agent. Two-device discovery, bidirectional
+fragmented GATT transfer, actual negotiated peer MTUs, connection election, and
+both controllers' scheduling behavior remain acceptance criteria.
 
-The implementation stopped at this hardware gate; later phases were not started.
-When hardware access is available, resume with the Phase 2 acceptance criteria in
-`plan.md` before claiming that phase complete.
+Hardware acceptance is not a prerequisite for implementing later software.
+Later phases have not been implemented; do not claim Phase 2 acceptance complete
+based solely on the memory transport or the one-controller probe.
 
 ## Doctor controller enumeration regression
 
@@ -97,3 +96,30 @@ suffixes, and nested BlueZ device paths. Both tests and all 83 workspace tests
 passed, clippy passed with warnings denied, and a local `doctor` smoke returned
 one controller and passed prerequisites. The user's laptop and Pi have not been
 remotely verified; their cross-device acceptance results remain pending.
+
+## Intermittent Pi/Arch discovery investigation
+
+The user ran the discovery-only probe four times: one run reported one peer
+on the Pi only, with no corresponding laptop discovery. This is a failure,
+not a discovery pass. The radio-level cause is not yet established.
+
+Code inspection found serial UUID/RSSI D-Bus reads inside a short scan window
+while BlueR replays cached devices before live events. Candidate evaluations
+now run independently of event draining, with at most four unique active
+evaluations and 256 queued candidates. Repeated sightings queue reevaluation;
+removals cancel pending/in-flight work. Service UUID and live-RSSI checks remain.
+Queue regressions cover deduplication, capacity, removal, and fairness behind
+an in-flight candidate. This corrects a starvation risk; it does not prove
+the user's asymmetric discovery is resolved.
+
+The probe now installs a privacy-safe logger, exposes existing scan warnings,
+counts distinct opaque locators, and exits nonzero after startup failures.
+`RUST_LOG=blendr_bluez=debug` adds scan-window and candidate-admission messages
+without addresses, peer identities, or payloads.
+
+All 89 workspace tests, formatting, clippy, and all-target builds passed. A
+14-second local probe showed two actual scan windows through D-Bus observation,
+debug start/end output, truthful zero-peer reporting, no MAC output, and cleanup.
+Disabled-advertising startup exited 1 after cleanup without a false watching
+status. New diagnostic logs from both user devices are still needed to
+distinguish actual radio/controller behavior from candidate rejection.

@@ -123,8 +123,24 @@ cargo run --locked -p blendr-transport --example memory_smoke
 cargo run --locked -p blendr-bluez --example probe -- config.json --duration 5
 ```
 
-On two available Linux hosts, run the probe with `--spike --duration 30` on
-both to exercise fixed diagnostic-frame exchange. This is not secure chat.
+For discovery troubleshooting, enable privacy-safe transport diagnostics on both
+devices and capture stdout and stderr:
+
+```sh
+RUST_LOG=blendr_bluez=debug ./target/debug/examples/probe config.json --duration 30 \
+  2>&1 | tee /tmp/blendr-discovery.log
+```
+
+`scan request` reports requested settings, not successful scanner startup.
+`scan window start/end` debug messages identify actual discovery sessions.
+Candidate checks report service-match and RSSI-presence booleans without device
+addresses. The default configuration scans for 3 seconds every 10 seconds.
+
+For fixed diagnostic-frame exchange, start one host with
+`--spike --duration 180`, then the other with `--spike --duration 15`.
+The sender connects after its observation period; the other host must still be
+listening. Stop the long-running probe after the echo, then reverse roles.
+These diagnostic frames are not secure chat.
 
 ## Limitations
 

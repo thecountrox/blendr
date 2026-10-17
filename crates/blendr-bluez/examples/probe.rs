@@ -2,19 +2,24 @@
 //! controller.
 //!
 //! Registers the GATT application, advertises the service UUID, scans for a
-//! bounded duration, and reports adapter prerequisites, scan/advertise
-//! status, peer count, and link MTU. Hardware addresses are never printed.
+//! bounded duration, and reports adapter prerequisites, requested scan
+//! parameters, advertise status, distinct peers, and link MTU. Hardware
+//! addresses are never printed. Transport warnings/errors (e.g. discovery
+//! filter or start failures) go to stderr; the default filter is limited to
+//! this crate so logs cannot expose neighboring devices — override with
+//! RUST_LOG only for explicit debugging.
 //!
 //! Usage: `probe [CONFIG_PATH] [--duration SECONDS] [--spike]`
 //!
 //! `--spike` additionally exercises a two-device fixed-frame exchange: the
-//! probe connects to the first discovered peer, sends a fixed test frame,
-//! and echoes any inbound frames back. Run a second instance on another
+//! probe connects to the last discovered peer still live, sends a fixed test
+//! frame, and echoes any inbound frames back. Run a second instance on another
 //! host to see real traffic. Never sends user plaintext.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use blendr_transport::{BleTransport, PeerEvent};
+use blendr_transport::{BleTransport, PeerEvent, PeerLocator};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -22,6 +27,14 @@ const FIXED_TEST_FRAME: &[u8] = b"BLENDR-PROBE-01";
 
 #[tokio::main]
 async fn main() {
+    // Install a logging backend so blendr-bluez warn/error diagnostics reach
+    // stderr. Without this the crate's log::warn calls are silently dropped.
+    // Default: this crate only, warnings and above — no Bluetooth addresses
+    // from dependencies can leak. RUST_LOG overrides for explicit debugging.
+    env_logger::init_from_env(
+        env_logger::Env::default().default_filter_or("off,blendr_bluez=warn"),
+    );
+
     let mut config_path = "config.json".to_string();
     let mut duration_secs: u64 = 10;
     let mut spike = false;
@@ -69,58 +82,75 @@ async fn main() {
         .gatt_service_uuid
         .parse()
         .expect("validated uuid");
-    match transport.start_advertising(service).await {
-        Ok(()) => println!("advertising: started (service UUID only)"),
-        Err(e) => println!("advertising: unavailable ({e})"),
+    if let Err(e) = transport.start_advertising(service).await {
+        eprintln!("probe: advertising start FAILED: {e}");
+        shutdown(&transport).await;
+        std::process::exit(1);
     }
+    println!("advertising: started (service UUID only)");
 
     let mut peer_rx = match transport.watch_peers().await {
-        Ok(rx) => Some(rx),
+        Ok(rx) => rx,
         Err(e) => {
-            println!("scan: unavailable ({e})");
-            None
+            eprintln!("probe: peer watch FAILED: {e}");
+            shutdown(&transport).await;
+            std::process::exit(1);
         }
     };
     let mut link_rx = match transport.accept_links().await {
-        Ok(rx) => Some(rx),
+        Ok(rx) => rx,
         Err(e) => {
-            println!("accept: unavailable ({e})");
-            None
+            eprintln!("probe: inbound link accept FAILED: {e}");
+            shutdown(&transport).await;
+            std::process::exit(1);
         }
     };
 
-    println!("scanning for {duration_secs}s...");
+    // Requested parameters only: this is not proof the scanner started. Filter
+    // or start failures surface as blendr_bluez warnings on stderr.
+    println!(
+        "scan request: window={}ms interval={}ms (effective interval >= window + 200ms); discovery.scan={}",
+        config.discovery.scan_window_ms, config.discovery.scan_interval_ms, config.discovery.scan
+    );
+    if !config.discovery.scan {
+        println!(
+            "note: discovery.scan=false — transport will not run a scanner; expect zero peers"
+        );
+    }
+    println!("watching for peers for {duration_secs}s...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
-    let mut seen = 0usize;
+    let mut distinct_peers: HashSet<PeerLocator> = HashSet::new();
+    let mut live_peers: HashSet<PeerLocator> = HashSet::new();
     let mut last_peer = None;
+    let mut peer_open = true;
+    let mut link_open = true;
     let cancel = CancellationToken::new();
 
     loop {
-        let peer_evt = async {
-            match peer_rx.as_mut() {
-                Some(rx) => rx.recv().await,
-                None => std::future::pending().await,
-            }
-        };
-        let link_evt = async {
-            match link_rx.as_mut() {
-                Some(rx) => rx.recv().await,
-                None => std::future::pending().await,
-            }
-        };
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => break,
-            evt = peer_evt => match evt {
+            evt = peer_rx.recv(), if peer_open => match evt {
                 Some(PeerEvent::Discovered(loc)) => {
-                    seen += 1;
+                    if distinct_peers.insert(loc.clone()) {
+                        println!("peer discovered ({} distinct)", distinct_peers.len());
+                    }
+                    live_peers.insert(loc.clone());
                     last_peer = Some(loc);
-                    println!("peer discovered (#{seen})");
                 }
-                Some(PeerEvent::Lost(_)) => println!("peer lost"),
-                None => {}
+                Some(PeerEvent::Lost(loc)) => {
+                    live_peers.remove(&loc);
+                    if last_peer.as_ref() == Some(&loc) {
+                        last_peer = live_peers.iter().next().cloned();
+                    }
+                    println!("peer lost ({} live)", live_peers.len());
+                }
+                None => {
+                    peer_open = false;
+                    println!("peer event channel closed; discovery events stopped");
+                }
             },
-            link = link_evt => {
-                if let Some(mut link) = link {
+            link = link_rx.recv(), if link_open => match link {
+                Some(mut link) => {
                     println!("inbound link: role={:?} frame_mtu={}", link.role(), link.mtu());
                     if spike {
                         tokio::spawn(async move {
@@ -134,15 +164,23 @@ async fn main() {
                         });
                     }
                 }
-            }
+                None => {
+                    link_open = false;
+                    println!("inbound link channel closed; accepting stopped");
+                }
+            },
         }
     }
 
-    println!("result: {seen} distinct peer(s) discovered in {duration_secs}s");
+    println!(
+        "result: {} distinct peer(s) discovered in {duration_secs}s ({} still live)",
+        distinct_peers.len(),
+        live_peers.len()
+    );
 
     if spike {
         if let Some(locator) = last_peer {
-            print!("spike: connecting to first peer... ");
+            print!("spike: connecting to last live discovered peer... ");
             match transport.connect(locator, &cancel).await {
                 Ok(mut link) => {
                     println!("ok (role={:?}, mtu={})", link.role(), link.mtu());
@@ -163,6 +201,11 @@ async fn main() {
         }
     }
 
+    shutdown(&transport).await;
+}
+
+/// Stop advertising and shut the transport down, reporting failures.
+async fn shutdown(transport: &blendr_bluez::BluezTransport) {
     if let Err(e) = transport.stop_advertising().await {
         println!("stop advertising: {e}");
     }
