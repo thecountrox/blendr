@@ -1,0 +1,5 @@
+/target
+/data
+/config.local.json
+/*.sqlite3
+/*.enc

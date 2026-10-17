@@ -1,0 +1,113 @@
+{
+  "config_version": 1,
+  "node": {
+    "display_name": "alice",
+    "mode": "broadcast",
+    "data_dir": "./data",
+    "start_discoverable": true
+  },
+  "identity": {
+    "keystore_path": "./data/identity.enc",
+    "keystore_backend": "encrypted_file",
+    "display_bid_suffix_chars": 12,
+    "allow_encrypted_backup": true
+  },
+  "discovery": {
+    "enabled": true,
+    "advertise": true,
+    "scan": true,
+    "service_uuid": "c2f60001-e7ca-4ac2-b6cd-10d5c0bf0001",
+    "rotate_discovery_token_seconds": 900,
+    "scan_window_ms": 3000,
+    "scan_interval_ms": 10000,
+    "peer_stale_after_seconds": 120,
+    "auto_connect": false
+  },
+  "transport": {
+    "preferred": "ble",
+    "ble": {
+      "adapter": "auto",
+      "gatt_service_uuid": "c2f60001-e7ca-4ac2-b6cd-10d5c0bf0001",
+      "gatt_rx_characteristic_uuid": "c2f60002-e7ca-4ac2-b6cd-10d5c0bf0001",
+      "gatt_tx_characteristic_uuid": "c2f60003-e7ca-4ac2-b6cd-10d5c0bf0001",
+      "preferred_mtu": 185,
+      "max_frame_payload_bytes": 128,
+      "reassembly_timeout_ms": 15000,
+      "connection_timeout_ms": 15000,
+      "max_concurrent_links": 2,
+      "connect_retry_attempts": 3,
+      "connect_retry_backoff_ms": 2000
+    }
+  },
+  "mesh": {
+    "enabled": true,
+    "outgoing": {
+      "allow_jumps": true,
+      "max_jumps": 3
+    },
+    "incoming": {
+      "accept_relayed_messages": true,
+      "max_jumps": 3
+    },
+    "relay": {
+      "enabled": false,
+      "queue_max_messages": 250,
+      "queue_max_bytes": 2097152,
+      "max_relay_message_bytes": 8192,
+      "forward_batch_max_messages": 20,
+      "max_distinct_peer_copies_per_message": 6,
+      "per_peer_offer_interval_seconds": 30
+    },
+    "routing": {
+      "strategy": "bounded_epidemic",
+      "deduplicate_by_message_id": true,
+      "avoid_previous_peer": true,
+      "reject_expired_messages": true
+    }
+  },
+  "messaging": {
+    "max_text_utf8_bytes": 4096,
+    "default_message_ttl_seconds": 86400,
+    "sharing": {
+      "default_visibility": "private",
+      "broadcast_requires_explicit_opt_in": true,
+      "sync_max_messages_per_session": 20,
+      "sync_max_bytes_per_session": 16384,
+      "inventory_max_message_ids": 128
+    },
+    "acknowledgements": {
+      "link_receipt": true,
+      "destination_delivery_receipt": true
+    }
+  },
+  "security": {
+    "identity_signature": "ed25519",
+    "bid_hash": "sha256",
+    "bid_encoding": "base32_nopad",
+    "session_handshake": "noise_xx",
+    "asynchronous_message_encryption": "hpke_x25519_hkdf_sha256_chacha20poly1305",
+    "require_authenticated_sessions": true,
+    "peer_trust_policy": "tofu_with_manual_verification",
+    "blocked_bids": []
+  },
+  "storage": {
+    "engine": "sqlite",
+    "database_path": "./data/blendr.sqlite3",
+    "wal_enabled": true,
+    "message_history_retention_days": 0,
+    "relay_expiry_cleanup_interval_seconds": 300,
+    "seen_message_id_retention_days": 7
+  },
+  "observability": {
+    "log_level": "info",
+    "log_payload_contents": false,
+    "log_peer_identifiers": false
+  },
+  "features": {
+    "broadcast_mode": true,
+    "direct_messages": true,
+    "match_mode_v2": false,
+    "wifi_transport": false,
+    "internet_relay": false
+  }
+}
