@@ -12,9 +12,11 @@ features for implemented behavior.
   atomic settings writes, doctor diagnostics, and CI.
 - Phase 1: implemented and verified — decentralized identity, encrypted keystore,
   SQLite persistence, and local CLI workflows.
-- Phase 2: transport software implemented; full two-device hardware acceptance
-  is pending. Paired Pi/Arch discovery passed a 35-second run after moving UUID
-  filtering into Blendr; diagnostic-frame exchange and election remain unverified.
+- Phase 2: transport software implemented; physical discovery, fragmented
+  transfers, reconnect, election, cancellation, and timeout recovery have passed
+  diagnostic runs. Full hardware acceptance remains conditional: transfers used
+  temporary Pi MIDI-plugin isolation, and later Pi-initiated connections failed
+  below ATT. See the current acceptance evidence and blockers below.
 - Phases 3–8: not implemented. Secure sessions, HPKE addressed messaging, broadcast
   sync, mesh forwarding, Android interoperability, and protocol freeze are pending.
   No Kotlin/Compose app, Android BLE adapter, JNI bridge, or Android Keystore
@@ -37,22 +39,23 @@ features for implemented behavior.
   cancellation, timeout recovery, and an in-memory radio with loss, delay,
   disconnection, range changes, bounded queues, and connection election.
 - `crates/blendr-bluez`: service-only advertising, application-filtered discovery,
-  GATT client/server packet IO, runtime packet MTU, retries, and shutdown lifecycle.
-  Paired discovery passed; client transfer attempts have failed and connection
-  election has not been verified against a second device.
+  GATT client/server packet IO, runtime packet MTU, retries, connection-lifetime
+  tracking, and election-safe shutdown. Physical transfer and election evidence
+  exists under the documented diagnostic isolation; unrestricted reliability
+  is not established.
 - `apps/linux-cli`: `doctor`, `init`, `identity show|rename|export|import`, `note`,
   and searchable `inbox`. Notes remain local-only. There is no node application
   implementing `start`, `peers`, `send`, `publish`, or `mesh`.
 
 ## Verification evidence
 
-The last complete local verification passed formatting, clippy with warnings
-denied, all-target builds, and 89 workspace tests:
+The latest complete local verification passed formatting, clippy with warnings
+denied, all-target builds, and 92 tests across nine all-target workspace suites:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo test --workspace --all-targets --locked
 cargo build --workspace --all-targets --locked
 ```
 
@@ -78,10 +81,12 @@ compiler, clippy, test, and runtime evidence are the available verification.
 The local environment exposes one Linux controller. The Raspberry Pi is now
 remotely accessible with `ssh -i ~/.ssh/tvpi pi@tvpi.local`, with its checkout at
 `/home/pi/blendr` (fallback address: `192.168.1.50`). Both devices pass `doctor`.
-Paired discovery passed a 35-second simultaneous scan/advertise run after the
-application-side UUID-filter workaround. Bidirectional fragmented GATT transfer,
-Blendr packet MTUs, connection election, and sustained discovery reliability
-remain acceptance criteria.
+Two-minute paired discovery passed with both original daemon configurations.
+Bidirectional fragmented GATT transfers, actual packet MTUs, reconnect, election,
+cancellation, and partial-frame timeout recovery passed with the Pi MIDI plugin
+temporarily disabled. That override has been removed. Later reverse-initiation
+trials failed before ATT even under isolation; these failures prevent an
+unqualified Phase 2 acceptance claim.
 
 Hardware acceptance is not a prerequisite for implementing later software.
 Later phases have not been implemented; do not claim Phase 2 acceptance complete
@@ -265,3 +270,94 @@ advertisements.
 This verifies paired discovery for this run, not dense-environment throughput
 or sustained reliability. Diagnostic-frame exchange was not repeated in this
 run, and the previously observed pairing failure remains unresolved.
+
+### Current Phase 2 transfer and lifecycle evidence
+
+The discovery workaround was committed as
+`e72639d fix(bluez): filter discovery service UUIDs in application`.
+Subsequent HCI/D-Bus tracing identified the earlier security negotiation trigger:
+the Pi read the laptop's BLE-MIDI characteristic
+`f36b109d-66f2-a9a1-1241-6838dbe57277` at handle `0x0017`, received ATT
+Insufficient Encryption (`0x0f`), and attempted SMP without an approving agent.
+GAP Name and Appearance reads succeeded. This supersedes the hypothesis that
+GAP attributes caused the pairing request.
+
+With explicit user approval, a separate runtime-only Pi systemd drop-in added
+`--noplugin=midi` to its original bluetoothd command. No trust flags, bonds,
+pairing approvals, original config files, or laptop system settings were changed.
+All transfer evidence below used that isolation:
+
+- Both GATT initiation orientations passed exact 1024-, 4096-, and 8192-byte
+  requests and echoes in both directions. Each round validates twelve frames.
+  Acquired reader MTU was 517, writer MTU 512, and the configured packet cap 64;
+  the application frame limit was 8192, not an ATT MTU.
+- Three-round physical reconnect passed in each initiation orientation during
+  development. Laptop-initiated reconnect also passed after the disconnect-watch
+  correction. Later Pi-initiated failures are retained below, not averaged away.
+- Concurrent dial attempts converged on a laptop initiator and Pi responder,
+  then validated three rounds / 36 data frames on the winning link. The Pi's
+  initial Connect timed out while an inbound link formed; its retry completed,
+  and post-dial election retained the inbound winner.
+- Every successful fresh probe link checked pre-cancelled send/receive and a
+  receive cancelled after 100 ms, each with a one-second completion bound.
+- A throwaway physical fault injector sent only the first fragment of a
+  1024-byte frame. The Pi returned `Timeout` with a one-second reassembly limit,
+  then received an exact complete 1024-byte frame and echoed it on the same
+  connection. It subsequently observed physical disconnection. Both processes
+  exited zero; the throwaway source was removed from both checkouts.
+- An intentionally wrong TX characteristic UUID caused a nonzero client failure
+  after service discovery. Cleanup completed; a subsequent correctly configured
+  client exchanged all twelve frames with the same still-running listener.
+  Independent Pi HCI observation recorded two connections and two disconnections.
+- Disabled discovery/advertising startup exited nonzero without claiming a
+  watching or successful-exchange state.
+
+Reconnect exposed two application lifecycle defects. Dropping acquired IO alone
+did not reliably notify the peer of closure. On Pi BlueZ, old server IO also
+received traffic from a subsequent physical connection. The adapter now watches
+`Device1.Connected=false`, wakes blocked IO through cancellation tokens, and
+reserves an elected initiator's peer until device-wide disconnect completes.
+Superseded links cannot disconnect their election winner. Failed or cancelled
+dials clean up only when no elected link owns the ACL; shutdown waits for those
+cleanup tasks. The diagnostic completion handshake assigns physical teardown
+to the initiator and prevents stale round receipts from passing a reconnect.
+
+### Remaining hardware blockers and restoration
+
+Later Pi-initiated trials failed all three configured Connect attempts with
+`le-connection-abort-by-local`; listeners correctly exited nonzero at their
+deadline. Pi HCI tracing showed successful LE Connection Complete events
+followed about 300 ms later by disconnect reason `0x3e`
+(`Connection Failed to be Established`), with **zero ATT operations**.
+The requested supervision timeout was 420 ms. A separate trial with laptop
+scanning disabled still failed, so concurrent laptop scanning is not established
+as the cause. No connection-parameter tuning, extra retries, automatic pairing,
+or controller-reset workaround was added.
+
+Service-resolution timeouts also occurred in earlier trials. Successful later
+runs do not establish that all daemon/controller intermittency is resolved.
+The previously observed Pi daemon crash remains unattributed. Privileged laptop
+HCI/controller evidence is unavailable without user assistance; laptop sudo
+requires a password. Further low-level diagnosis needs that evidence alongside
+the Pi trace, not changes to Blendr's service UUID or suppression of errors.
+
+The temporary `/run/systemd/system/bluetooth.service.d/90-blendr-phase2.conf`
+was removed, systemd reloaded, and Pi Bluetooth restarted. Verification showed
+`ActiveState=active`, no drop-ins, and original ExecStart
+`/usr/libexec/bluetooth/bluetoothd` with no `--noplugin` argument.
+
+After restoration, both hosts passed simultaneous 120-second discovery with
+the original three-second / ten-second scan schedule: each observed one distinct
+peer, retained one live peer, and completed twelve scan windows. Independent
+D-Bus sampling observed scanning plus advertising together in 141 laptop samples
+and 130 Pi samples, with zero query errors and unchanged daemon PIDs on both.
+This establishes sustained foreground discovery for the run, not uninterrupted
+radio airtime or reliable default-configuration GATT transfer.
+
+Final local verification passed formatting, workspace all-target clippy with
+warnings denied, all 92 all-target tests, and all-target builds. The Pi passed
+its nine blendr-bluez all-target tests. A discovery run with an unmatched service
+UUID and `--require-peer` exited 1; conflicting exchange roles exited 2.
+After asynchronous BlueZ cleanup settled, independent checks on both hosts
+showed `Discovering=false` and `ActiveInstances=0`. The throwaway fault-injector
+source and temporary diagnostic config copies were removed from both checkouts.

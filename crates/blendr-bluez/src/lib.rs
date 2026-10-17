@@ -33,12 +33,15 @@ use bluer::gatt::local::{
     CharacteristicWrite, CharacteristicWriteMethod, ReqError, Service, characteristic_control,
 };
 use bluer::gatt::{CharacteristicReader, CharacteristicWriter};
-use bluer::{Adapter, AdapterEvent, Address, Device, DiscoveryFilter, DiscoveryTransport, Session};
+use bluer::{
+    Adapter, AdapterEvent, Address, Device, DeviceEvent, DeviceProperty, DiscoveryFilter,
+    DiscoveryTransport, Session,
+};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use uuid::Uuid;
 
 mod discovery;
@@ -211,11 +214,18 @@ async fn with_cancel_timeout<F, T>(
 where
     F: Future<Output = std::result::Result<T, bluer::Error>>,
 {
-    tokio::select! {
+    log::debug!("blendr-bluez: {context} start");
+    let result = tokio::select! {
+        biased;
         _ = cancel.cancelled() => Err(TransportError::Cancelled),
         _ = tokio::time::sleep(timeout) => Err(TransportError::Timeout),
         res = fut => res.map_err(platform(context)),
+    };
+    match &result {
+        Ok(_) => log::debug!("blendr-bluez: {context} complete"),
+        Err(e) => log::debug!("blendr-bluez: {context} failed: {e}"),
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +257,7 @@ struct LinkRecord {
     /// Strong ref held by the live link; `strong_count()==0` once it drops.
     token: Weak<()>,
     /// Hard-kill switch wired into the link's packet IO (election loser).
-    kill: Arc<AtomicBool>,
+    kill: CancellationToken,
     role: LinkRole,
     device: Device,
 }
@@ -258,6 +268,8 @@ struct Links {
     active: HashMap<Address, LinkRecord>,
     /// `connect()` calls currently dialing a remote device.
     outbound_inflight: HashSet<Address>,
+    /// Peers whose elected link is waiting for Device1.Disconnect.
+    closing: HashSet<Address>,
 }
 
 impl Links {
@@ -281,6 +293,42 @@ impl Links {
 // PacketIo over a pair of GATT IO streams
 // ---------------------------------------------------------------------------
 
+// BlueZ may retain acquired server sockets across an ACL reconnect. Socket EOF
+// alone therefore cannot delimit a PeerLink's physical connection lifetime.
+struct ConnectedDevice {
+    device: Device,
+    watch: DropGuard,
+}
+
+impl ConnectedDevice {
+    async fn new(device: Device, cancel: &CancellationToken, timeout: Duration) -> Result<Self> {
+        let events =
+            with_cancel_timeout(cancel, timeout, "watch connection", device.events()).await?;
+        if !with_cancel_timeout(cancel, timeout, "connection state", device.is_connected()).await? {
+            return Err(TransportError::Disconnected);
+        }
+        let kill = CancellationToken::new();
+        let watch = kill.clone().drop_guard();
+        tokio::spawn(async move {
+            tokio::pin!(events);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = kill.cancelled() => break,
+                    event = events.next() => match event {
+                        None | Some(DeviceEvent::PropertyChanged(DeviceProperty::Connected(false))) => {
+                            kill.cancel();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        Ok(Self { device, watch })
+    }
+}
+
 /// One packet per GATT write (peer→us) or notification (us→peer).
 ///
 /// `bluer`'s IO sockets preserve ATT packet boundaries, so `send`/`recv` map
@@ -290,12 +338,18 @@ struct GattPacketIo {
     reader: CharacteristicReader,
     writer: CharacteristicWriter,
     mtu: usize,
-    kill: Arc<AtomicBool>,
+    kill: CancellationToken,
+}
+
+impl Drop for GattPacketIo {
+    fn drop(&mut self) {
+        self.kill.cancel();
+    }
 }
 
 impl GattPacketIo {
     fn check_kill(&self) -> Result<()> {
-        if self.kill.load(Ordering::SeqCst) {
+        if self.kill.is_cancelled() {
             Err(TransportError::Disconnected)
         } else {
             Ok(())
@@ -319,7 +373,9 @@ impl PacketIo for GattPacketIo {
             )));
         }
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => Err(TransportError::Cancelled),
+            _ = self.kill.cancelled() => Err(TransportError::Disconnected),
             res = self.writer.send(packet) => res.map_err(disconnected_io("gatt send")),
         }
     }
@@ -327,7 +383,9 @@ impl PacketIo for GattPacketIo {
     async fn recv_packet(&mut self, cancel: &CancellationToken) -> Result<Vec<u8>> {
         self.check_kill()?;
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => Err(TransportError::Cancelled),
+            _ = self.kill.cancelled() => Err(TransportError::Disconnected),
             res = self.reader.recv() => {
                 let pkt = res.map_err(disconnected_io("gatt recv"))?;
                 if pkt.is_empty() {
@@ -340,10 +398,9 @@ impl PacketIo for GattPacketIo {
     }
 
     async fn close(&mut self) -> Result<()> {
-        self.kill.store(true, Ordering::SeqCst);
-        // Dropping this IO (when the link drops) ends our ATT sessions. We
-        // deliberately do not disconnect the ACL: both GATT directions share
-        // it, and BlueZ reaps idle links itself.
+        self.kill.cancel();
+        // Only the elected initiator disconnects the shared ACL. A competing
+        // responder teardown could abort the next connection or another profile.
         Ok(())
     }
 }
@@ -354,21 +411,82 @@ impl PacketIo for GattPacketIo {
 
 struct GuardedLink {
     inner: FramedLink<GattPacketIo>,
-    _token: Arc<()>,
-    on_close: Option<Box<dyn FnOnce() + Send>>,
+    token: Arc<()>,
+    owner: Weak<Inner>,
+    addr: Address,
+    finished: bool,
+}
+
+/// Keep the peer unavailable for a new link until disconnect completes.
+struct ClosingLink {
+    owner: Arc<Inner>,
+    addr: Address,
+    device: Device,
+}
+
+impl ClosingLink {
+    async fn disconnect(&self) -> Result<()> {
+        tokio::time::timeout(
+            self.owner.settings.connection_timeout,
+            self.device.disconnect(),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(platform("close elected link"))
+    }
+}
+
+impl Drop for ClosingLink {
+    fn drop(&mut self) {
+        self.owner
+            .links
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closing
+            .remove(&self.addr);
+        self.owner.closing_done.notify_waiters();
+    }
 }
 
 impl GuardedLink {
-    fn finish(&mut self) {
-        if let Some(cb) = self.on_close.take() {
-            cb();
+    fn finish(&mut self) -> Option<ClosingLink> {
+        if self.finished {
+            return None;
         }
+        self.finished = true;
+        let owner = self.owner.upgrade()?;
+        let device = {
+            let mut links = owner.links.lock().unwrap_or_else(|e| e.into_inner());
+            // An election loser must neither remove nor disconnect its winner.
+            if !links
+                .active
+                .get(&self.addr)
+                .is_some_and(|rec| rec.token.as_ptr() == Arc::as_ptr(&self.token))
+            {
+                return None;
+            }
+            let record = links.active.remove(&self.addr)?;
+            if record.role != LinkRole::Initiator {
+                return None;
+            }
+            links.closing.insert(self.addr);
+            record.device
+        };
+        Some(ClosingLink {
+            owner,
+            addr: self.addr,
+            device,
+        })
     }
 }
 
 impl Drop for GuardedLink {
     fn drop(&mut self) {
-        self.finish();
+        if let Some(closing) = self.finish() {
+            tokio::spawn(async move {
+                let _ = closing.disconnect().await;
+            });
+        }
     }
 }
 
@@ -396,8 +514,16 @@ impl PeerLink for GuardedLink {
 
     async fn close(&mut self) -> Result<()> {
         let res = self.inner.close().await;
-        self.finish();
-        res
+        let disconnected = if let Some(closing) = self.finish() {
+            // Keep cleanup alive, and the peer reserved, if the caller cancels
+            // close while BlueZ is still disconnecting the shared ACL.
+            tokio::spawn(async move { closing.disconnect().await })
+                .await
+                .map_err(|_| TransportError::Platform("link cleanup task failed".into()))?
+        } else {
+            Ok(())
+        };
+        res.and(disconnected)
     }
 }
 
@@ -427,6 +553,7 @@ struct Inner {
     adv_handle: Mutex<Option<AdvertisementHandle>>,
     peers: Mutex<HashMap<Address, PeerEntry>>,
     links: Mutex<Links>,
+    closing_done: Notify,
     peer_tx: mpsc::Sender<PeerEvent>,
     peer_rx: AsyncMutex<Option<mpsc::Receiver<PeerEvent>>>,
     link_tx: mpsc::Sender<Box<dyn PeerLink>>,
@@ -516,6 +643,7 @@ impl BluezTransport {
             adv_handle: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             links: Mutex::new(Links::default()),
+            closing_done: Notify::new(),
             peer_tx,
             peer_rx: AsyncMutex::new(Some(peer_rx)),
             link_tx,
@@ -578,13 +706,33 @@ impl BluezTransport {
         let devices: Vec<Device> = {
             let mut links = self.inner.links.lock().unwrap_or_else(|e| e.into_inner());
             for rec in links.active.values() {
-                rec.kill.store(true, Ordering::SeqCst);
+                rec.kill.cancel();
             }
             links.active.drain().map(|(_, rec)| rec.device).collect()
         };
         for dev in devices {
             let _ = dev.disconnect().await;
         }
+        // Failed dials and dropped initiators own asynchronous ACL cleanup.
+        // Do not report shutdown complete while that cleanup can still run.
+        tokio::time::timeout(self.inner.settings.connection_timeout, async {
+            loop {
+                let changed = self.inner.closing_done.notified();
+                if self
+                    .inner
+                    .links
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .closing
+                    .is_empty()
+                {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| TransportError::Timeout)?;
         self.inner
             .peers
             .lock()
@@ -642,18 +790,17 @@ impl Inner {
         role: LinkRole,
         reader: CharacteristicReader,
         writer: CharacteristicWriter,
-        device: Device,
+        connection: ConnectedDevice,
     ) -> Result<Box<dyn PeerLink>> {
-        let mtu = reader
-            .mtu()
-            .min(writer.mtu())
-            .min(self.settings.preferred_mtu);
+        let reader_mtu = reader.mtu();
+        let writer_mtu = writer.mtu();
+        let mtu = reader_mtu.min(writer_mtu).min(self.settings.preferred_mtu);
         if mtu == 0 {
             return Err(TransportError::Platform(
                 "peer negotiated zero ATT MTU".into(),
             ));
         }
-        let kill = Arc::new(AtomicBool::new(false));
+        let kill = connection.watch.disarm();
         let io = GattPacketIo {
             reader,
             writer,
@@ -661,25 +808,13 @@ impl Inner {
             kill: kill.clone(),
         };
         let framed = FramedLink::new(io, locator, role, self.link_config())?;
+        log::info!(
+            "blendr-bluez: link ready role={role:?} read_packet_mtu={reader_mtu} write_packet_mtu={writer_mtu} packet_mtu={mtu} frame_limit={}",
+            self.settings.max_frame_bytes
+        );
 
         let token = Arc::new(());
         let token_weak = Arc::downgrade(&token);
-        let close_token = token_weak.clone();
-        let this = Arc::downgrade(self);
-        let on_close: Box<dyn FnOnce() + Send> = Box::new(move || {
-            if let Some(this) = this.upgrade()
-                && let Ok(mut links) = this.links.lock()
-            {
-                // Remove only if the record still points at *this* link.
-                if links
-                    .active
-                    .get(&addr)
-                    .is_some_and(|rec| rec.token.ptr_eq(&close_token))
-                {
-                    links.active.remove(&addr);
-                }
-            }
-        });
         let mut links = self.links.lock().unwrap_or_else(|e| e.into_inner());
         links.active.insert(
             addr,
@@ -687,13 +822,15 @@ impl Inner {
                 token: token_weak,
                 kill,
                 role,
-                device,
+                device: connection.device,
             },
         );
         Ok(Box::new(GuardedLink {
             inner: framed,
-            _token: token,
-            on_close: Some(on_close),
+            token,
+            owner: Arc::downgrade(self),
+            addr,
+            finished: false,
         }))
     }
 }
@@ -807,6 +944,9 @@ impl BleTransport for BluezTransport {
         {
             let mut links = inner.links.lock().unwrap_or_else(|e| e.into_inner());
             links.prune();
+            if links.closing.contains(&addr) {
+                return Err(TransportError::ResourceLimit("link is closing".into()));
+            }
             if let Some(rec) = links.active.get(&addr) {
                 match (rec.role, Links::initiator_is_us(inner.local_addr, addr)) {
                     (LinkRole::Responder, false) => {
@@ -817,7 +957,7 @@ impl BleTransport for BluezTransport {
                     }
                     (LinkRole::Responder, true) => {
                         // We initiate; the inbound copy loses the election.
-                        rec.kill.store(true, Ordering::SeqCst);
+                        rec.kill.cancel();
                         links.active.remove(&addr);
                     }
                     (LinkRole::Initiator, _) => {
@@ -878,11 +1018,6 @@ impl BleTransport for BluezTransport {
         if !connected {
             return Err(last_err);
         }
-        // Both GATT directions share one ACL link on BlueZ, so once the
-        // device is connected we never disconnect on later failure paths —
-        // an elected inbound pair may ride the same link. Dropping acquired
-        // IO halves is enough; BlueZ reaps idle ACLs itself.
-        inflight.armed = false;
 
         // Resolve service + characteristics, then acquire packet IO.
         let (writer, reader) = acquire_client_io(
@@ -894,6 +1029,7 @@ impl BleTransport for BluezTransport {
             timeout,
         )
         .await?;
+        let connection = ConnectedDevice::new(device, cancel, timeout).await?;
 
         // Post-dial election: an inbound pair may have formed while dialing.
         {
@@ -907,7 +1043,7 @@ impl BleTransport for BluezTransport {
                         ));
                     }
                     (LinkRole::Responder, true) => {
-                        rec.kill.store(true, Ordering::SeqCst);
+                        rec.kill.cancel();
                         links.active.remove(&addr);
                     }
                     (LinkRole::Initiator, _) => {
@@ -918,9 +1054,11 @@ impl BleTransport for BluezTransport {
                 }
             }
             links.outbound_inflight.remove(&addr);
-            inflight.armed = false;
             drop(links);
-            inner.install_link(addr, peer, LinkRole::Initiator, reader, writer, device)
+            let result =
+                inner.install_link(addr, peer, LinkRole::Initiator, reader, writer, connection);
+            inflight.armed = result.is_err();
+            result
         }
     }
 
@@ -934,9 +1072,9 @@ impl BleTransport for BluezTransport {
     }
 }
 
-/// Disconnect `device` when `armed` and remove the inflight marker on drop.
+/// Failed/cancelled dials disconnect only when no elected link owns the ACL.
 struct InflightGuard<'a> {
-    inner: &'a Inner,
+    inner: &'a Arc<Inner>,
     addr: Address,
     device: Option<Device>,
     armed: bool,
@@ -944,16 +1082,28 @@ struct InflightGuard<'a> {
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut links) = self.inner.links.lock() {
+        let closing = {
+            let mut links = self.inner.links.lock().unwrap_or_else(|e| e.into_inner());
             links.outbound_inflight.remove(&self.addr);
-        }
-        if self.armed
-            && let Some(dev) = self.device.take()
-        {
-            tokio::spawn(async move {
-                let _ = dev.disconnect().await;
-            });
-        }
+            if !self.armed
+                || links.active.contains_key(&self.addr)
+                || links.closing.contains(&self.addr)
+            {
+                return;
+            }
+            let Some(device) = self.device.take() else {
+                return;
+            };
+            links.closing.insert(self.addr);
+            ClosingLink {
+                owner: self.inner.clone(),
+                addr: self.addr,
+                device,
+            }
+        };
+        tokio::spawn(async move {
+            let _ = closing.disconnect().await;
+        });
     }
 }
 
@@ -1045,7 +1195,7 @@ async fn accept_task(
                         match inner.adapter.device(addr) {
                             Ok(device) => match req.accept() {
                                 Ok(reader) => {
-                                    push_half(&inner, &mut pending, addr, InboundHalf::Reader(reader), device);
+                                    push_half(&inner, &mut pending, addr, InboundHalf::Reader(reader), device).await;
                                 }
                                 Err(e) => {
                                     log::warn!("blendr-bluez: accept write io failed: {}", scrub_addrs(&e.to_string()));
@@ -1068,7 +1218,7 @@ async fn accept_task(
                         let addr = writer.device_address();
                         match inner.adapter.device(addr) {
                             Ok(device) => {
-                                push_half(&inner, &mut pending, addr, InboundHalf::Writer(writer), device);
+                                push_half(&inner, &mut pending, addr, InboundHalf::Writer(writer), device).await;
                             }
                             Err(_) => {
                                 log::warn!("blendr-bluez: notify io for unknown device");
@@ -1092,7 +1242,7 @@ async fn accept_task(
 }
 
 /// Store a freshly arrived IO half and attempt to complete a link.
-fn push_half(
+async fn push_half(
     inner: &Arc<Inner>,
     pending: &mut HashMap<Address, PendingHalf>,
     addr: Address,
@@ -1140,27 +1290,44 @@ fn push_half(
                     return;
                 }
             };
-            complete_inbound(inner, addr, reader, writer, device);
+            complete_inbound(inner, addr, reader, writer, device).await;
         }
     }
 }
 
 /// Run election and bounded-queue admission for a fully paired inbound link.
-fn complete_inbound(
+async fn complete_inbound(
     inner: &Arc<Inner>,
     addr: Address,
     reader: CharacteristicReader,
     writer: CharacteristicWriter,
     device: Device,
 ) {
+    let connection = match ConnectedDevice::new(
+        device,
+        &inner.shutdown_token,
+        inner.settings.connection_timeout,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            log::warn!("blendr-bluez: inbound connection watch failed: {error}");
+            return;
+        }
+    };
     {
         let mut links = inner.links.lock().unwrap_or_else(|e| e.into_inner());
         links.prune();
+        if links.closing.contains(&addr) {
+            log::debug!("blendr-bluez: refusing inbound link during disconnect");
+            return;
+        }
         if let Some(rec) = links.active.get(&addr) {
             match (rec.role, Links::initiator_is_us(inner.local_addr, addr)) {
                 (LinkRole::Responder, _) => {
                     // Already have an inbound link; supersede it.
-                    rec.kill.store(true, Ordering::SeqCst);
+                    rec.kill.cancel();
                     links.active.remove(&addr);
                 }
                 (LinkRole::Initiator, true) => {
@@ -1172,7 +1339,7 @@ fn complete_inbound(
                 }
                 (LinkRole::Initiator, false) => {
                     // Peer initiates; our outbound link loses.
-                    rec.kill.store(true, Ordering::SeqCst);
+                    rec.kill.cancel();
                     links.active.remove(&addr);
                 }
             }
@@ -1203,7 +1370,14 @@ fn complete_inbound(
         .peer_tx
         .try_send(PeerEvent::Discovered(locator.clone()));
 
-    match inner.install_link(addr, locator, LinkRole::Responder, reader, writer, device) {
+    match inner.install_link(
+        addr,
+        locator,
+        LinkRole::Responder,
+        reader,
+        writer,
+        connection,
+    ) {
         Ok(link) => {
             if inner.link_tx.try_send(link).is_err() {
                 log::warn!("blendr-bluez: accept_links queue full; inbound link dropped");

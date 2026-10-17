@@ -127,7 +127,7 @@ For discovery troubleshooting, enable privacy-safe transport diagnostics on both
 devices and capture stdout and stderr:
 
 ```sh
-RUST_LOG=blendr_bluez=debug ./target/debug/examples/probe config.json --duration 30 \
+RUST_LOG=blendr_bluez=debug ./target/debug/examples/probe config.json --duration 120 --require-peer \
   2>&1 | tee /tmp/blendr-discovery.log
 ```
 
@@ -161,11 +161,78 @@ install an agent or automatically approve pairing. Review system/HCI logs before
 sharing them: unlike the probe's diagnostics, they can contain device addresses
 and other identifying data.
 
-For fixed diagnostic-frame exchange, start one host with
-`--spike --duration 180`, then the other with `--spike --duration 15`.
-The sender connects after its observation period; the other host must still be
-listening. Stop the long-running probe after the echo, then reverse roles.
-These diagnostic frames are not secure chat.
+### Two-host frame exchange
+
+On both hosts, use a diagnostic config with
+`transport.ble.max_frame_payload_bytes = 8192` and
+`transport.ble.preferred_mtu = 64`. Keep matching service/characteristic UUIDs.
+The probe validates these limits rather than silently changing configuration.
+
+```sh
+cargo build --locked -p blendr-bluez --example probe
+
+# Host A: accept connections without initiating.
+RUST_LOG=blendr_bluez=debug ./target/debug/examples/probe diagnostic.json \
+  --listen --duration 120 --rounds 3 --reconnect
+
+# Host B: discover and connect immediately.
+RUST_LOG=blendr_bluez=debug ./target/debug/examples/probe diagnostic.json \
+  --spike --duration 120 --rounds 3 --reconnect
+```
+
+Each round verifies exact 1 KiB, 4 KiB, and 8 KiB requests and echoes in both
+directions: twelve data frames per round, fragmented below the configured
+64-byte packet limit. Every fresh link also checks pre-cancelled send/receive
+and cancellation of an idle receive. Both hosts need matching `--rounds` and
+`--reconnect` options. Reverse the host roles to exercise the other GATT client.
+Without `--reconnect`, all rounds use one link.
+
+For competing connection attempts, run `--elect` on **both** hosts instead of
+`--listen`/`--spike`. It exchanges a diagnostic election marker, accepts only a
+matching peer's surviving link, and verifies the same two-way data exchange.
+Logs distinguish provisional outgoing links from the surviving role; merely
+running two processes is not evidence that their dial attempts overlapped.
+
+The `link ready` log reports acquired read/write packet MTUs and the effective
+configured packet cap. `PeerLink::mtu()` instead reports the maximum application
+frame size. Do not interpret that frame limit as the negotiated ATT MTU.
+
+The initiator closes the physical connection after round-scoped completion
+receipts; the listener observes disconnection before accepting the next link.
+BlueZ can retain server IO sockets across reconnects, so the adapter also watches
+`Device1.Connected`, rather than relying on socket EOF alone. Closing an elected
+initiator uses device-wide `Device1.Disconnect`, which can interrupt other
+Bluetooth profiles on that peer. Closing a responder releases its local link;
+it does not independently disconnect the shared ACL.
+
+Exit status is `0` for a completed requested diagnostic, `1` for runtime/config
+failure, and `2` for invalid arguments. Exchange, corruption, missing-peer,
+deadline, and cleanup failures are nonzero. Discovery alone permits zero peers
+unless `--require-peer` is supplied. `--duration` bounds setup and the subsequent
+diagnostic phase separately. These frames contain synthetic diagnostic data,
+not user messages, and are **not secure chat**.
+
+### Unrelated profiles and controller failures
+
+BlueZ `Device1.Connect` can initialize unrelated profiles as well as Blendr GATT.
+In particular, a BLE-MIDI profile may read an encryption-protected MIDI attribute
+and trigger pairing even though Blendr's characteristics do not require pairing.
+Changing Blendr's UUID does not prevent that profile initialization.
+
+If HCI evidence identifies MIDI as the trigger, an administrator can temporarily
+isolate BlueZ's `midi` plugin (`bluetoothd --noplugin=midi`) for diagnostics.
+Inspect the distribution's existing service command and preserve its other
+arguments; use a separate runtime-only systemd drop-in, restart Bluetooth, then
+remove only that drop-in and restart again afterward. This disables BLE-MIDI
+functionality while active and interrupts existing Bluetooth connections.
+Blendr never changes daemon configuration, trusts devices, or approves pairing
+automatically. Plugin isolation is not a general Bluetooth security workaround.
+
+An HCI disconnect reason `0x3e` (“Connection Failed to be Established”) before
+any ATT traffic is a lower-layer failure, not a Blendr frame-validation failure.
+Capture both controllers' HCI/kernel/daemon evidence before changing scheduling
+or connection parameters. A successful isolated run does not establish reliable
+operation with the original daemon configuration.
 
 ## Limitations
 
