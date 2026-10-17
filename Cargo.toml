@@ -2,5 +2,6 @@
 members = [
     "crates/blendr-config",
     "crates/blendr-identity",
+    "crates/blendr-storage",
 ]
 resolver = "3"
