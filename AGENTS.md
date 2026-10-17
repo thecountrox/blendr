@@ -50,7 +50,7 @@ features for implemented behavior.
 ## Verification evidence
 
 The latest complete local verification passed formatting, clippy with warnings
-denied, all-target builds, and 92 tests across nine all-target workspace suites:
+denied, all-target builds, and 94 tests across ten all-target workspace suites:
 
 ```sh
 cargo fmt --all --check
@@ -361,3 +361,29 @@ UUID and `--require-peer` exited 1; conflicting exchange roles exited 2.
 After asynchronous BlueZ cleanup settled, independent checks on both hosts
 showed `Discovering=false` and `ActiveInstances=0`. The throwaway fault-injector
 source and temporary diagnostic config copies were removed from both checkouts.
+
+### Executable plaintext message demo
+
+`crates/blendr-bluez/examples/message_demo.rs` provides one real BLE text request
+and reply with completion receipts, bounded deadlines, and connection cleanup.
+It is explicitly unauthenticated, unencrypted diagnostic messaging, not Phase 3
+chat: no identity binding, persistence, or history was added. Received terminal
+control characters are escaped. Both message size and peer frame type/UTF-8 are
+validated; the original 128-byte frame limit allows 115 UTF-8 bytes of text.
+README documents build/run commands and temporary Pi MIDI isolation/restoration.
+
+The initial run with the original daemon configuration failed during connection
+setup and returned nonzero on both hosts. Under the same previously approved
+temporary Pi MIDI-plugin isolation, the laptop sent
+`Hello tvpi, from the laptop` and received `Hello laptop, from tvpi`; the Pi
+displayed the corresponding received message and reply. Both processes completed
+the receipt/close handshake and exited zero. The dedicated runtime override was
+removed in a finally block; the Pi service was confirmed active with its original
+ExecStart and no drop-ins. No persistent daemon settings, trust, or bonds changed.
+
+CLI smoke checks also confirmed conflicting roles exit 2, empty text exits 1
+before opening the adapter, and a missing listener peer expires nonzero.
+Final formatting, workspace all-target clippy with warnings denied, all 94 tests,
+and all-target builds passed. The Pi built the demo and passed its two
+message-boundary/malformed-frame tests. Sources and executable are deployed to
+`/home/pi/blendr`; the temporary MIDI override is deliberately not left active.

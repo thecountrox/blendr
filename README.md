@@ -161,6 +161,71 @@ install an agent or automatically approve pairing. Review system/HCI logs before
 sharing them: unlike the probe's diagnostics, they can contain device addresses
 and other identifying data.
 
+### Text-message demo (plaintext)
+
+`message_demo` sends one text message and one reply over real BLE, confirms
+receipt, and exits on both hosts. It is **not secure Blendr messaging**: no
+encryption, peer authentication, identity binding, persistence, or chat history.
+Use non-sensitive test text only; `--message` is also visible in shell history
+and process arguments. Stop other Blendr probes/demos first: the connector uses
+the first discovered Blendr peer, not an authenticated recipient.
+
+Build on both hosts:
+
+```sh
+cargo build --locked -p blendr-bluez --example message_demo
+```
+
+Start the listener first:
+
+```sh
+./target/debug/examples/message_demo config.json \
+  --listen --message 'Hello laptop, from the Pi' --timeout 180
+```
+
+Then run on the other host:
+
+```sh
+./target/debug/examples/message_demo config.json \
+  --connect --message 'Hello Pi, from the laptop' --timeout 90
+```
+
+Each terminal prints `You:` and `Peer:` followed by the text. Remote control
+characters are escaped rather than interpreted by the terminal. Both processes
+exit zero only after the exchange and cleanup complete. Invalid arguments exit
+2; connection, deadline, message-size, protocol, and cleanup failures exit 1.
+The sample configuration permits 115 UTF-8 bytes of text per message (128-byte
+frame limit minus 13 bytes of demo overhead); longer text requires increasing
+`transport.ble.max_frame_payload_bytes` on both hosts.
+
+The daemon/controller limitations below still apply. If BLE-MIDI is triggering
+pairing, temporary plugin isolation may be needed. On a Raspberry Pi whose
+existing service command is **exactly** `/usr/libexec/bluetooth/bluetoothd`, this
+creates a separate runtime-only override; do not use it to overwrite other
+service arguments. Restarting Bluetooth interrupts existing connections.
+
+```sh
+systemctl show bluetooth -p ExecStart -p DropInPaths
+sudo install -d /run/systemd/system/bluetooth.service.d
+printf '%s\n' '[Service]' 'ExecStart=' \
+  'ExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=midi' |
+  sudo sh -c 'set -C; cat > /run/systemd/system/bluetooth.service.d/90-blendr-message-demo.conf' &&
+  sudo systemctl daemon-reload &&
+  sudo systemctl restart bluetooth
+```
+
+Run the listener and connector after that restart. After the demo, remove **only
+the override you created**, then restore the original daemon:
+
+```sh
+sudo rm -- /run/systemd/system/bluetooth.service.d/90-blendr-message-demo.conf
+sudo systemctl daemon-reload
+sudo systemctl restart bluetooth
+```
+
+This temporarily disables BLE-MIDI, not Bluetooth encryption or pairing policy.
+It does not fix controller-level connection failures.
+
 ### Two-host frame exchange
 
 On both hosts, use a diagnostic config with
