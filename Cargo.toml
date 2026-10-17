@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/linux-cli",
     "crates/blendr-config",
     "crates/blendr-identity",
     "crates/blendr-storage",

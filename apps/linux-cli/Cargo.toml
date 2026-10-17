@@ -1,0 +1,19 @@
+[package]
+name = "blendr-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Blendr local-first BLE messaging: Linux command-line interface"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+blendr-config = { path = "../../crates/blendr-config" }
+clap = { version = "4", features = ["derive"] }
+blendr-identity = { path = "../../crates/blendr-identity" }
+blendr-storage = { path = "../../crates/blendr-storage" }
+rpassword = "7"
+zeroize = "1"
+serde_json = "1"
+
+[[bin]]
+name = "blendr"
+path = "src/main.rs"
