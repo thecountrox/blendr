@@ -136,6 +136,31 @@ RUST_LOG=blendr_bluez=debug ./target/debug/examples/probe config.json --duration
 Candidate checks report service-match and RSSI-presence booleans without device
 addresses. The default configuration scans for 3 seconds every 10 seconds.
 
+Scanning is LE-only, with no BlueZ service-UUID restriction. Blendr filters
+candidates itself using the configured service UUID and RSSI presence. This
+avoids the BlueZ 5.87 UUID-filter crash
+([upstream issue #2282](https://github.com/bluez/bluez/issues/2282)) without
+changing the advertised UUID, GATT service, or peer admission rules.
+Unrelated BLE sightings increase local processing; pending candidate evaluations
+remain bounded to 256 queued addresses and four concurrent evaluations.
+Another application's UUID-filtered scan can still trigger an affected daemon;
+this workaround is not a system-wide BlueZ fix.
+
+Blendr explicitly marks its LE advertisement as general-discoverable; it does
+not change the adapter's global discoverability or advertise a device name.
+Registration and scan-start messages alone do not prove over-the-air discovery.
+If discovery is asymmetric or connections time out, also check the BlueZ daemon:
+
+```sh
+journalctl -u bluetooth --since "10 minutes ago"
+```
+
+Daemon crashes/restarts invalidate an active probe run. Pairing-agent errors
+indicate a separate Bluetooth security negotiation failure; the probe does not
+install an agent or automatically approve pairing. Review system/HCI logs before
+sharing them: unlike the probe's diagnostics, they can contain device addresses
+and other identifying data.
+
 For fixed diagnostic-frame exchange, start one host with
 `--spike --duration 180`, then the other with `--spike --duration 15`.
 The sender connects after its observation period; the other host must still be

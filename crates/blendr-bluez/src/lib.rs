@@ -3,7 +3,7 @@
 //! Implements the shared [`blendr_transport`] contract over real BlueZ D-Bus
 //! operations: `LEAdvertisingManager1` advertisements carrying only the fixed
 //! service UUID (plus a transient token only when it fits the 31-byte legacy
-//! payload), UUID-filtered LE scanning with peer aging and opaque locators,
+//! payload), application-filtered LE scanning with peer aging and opaque locators,
 //! and a GATT server/client pair where RX (write-IO) and TX (notify-IO)
 //! streams are paired per remote device address through
 //! `characteristic_control` events. Framing, reassembly bounds, and sequence
@@ -724,6 +724,9 @@ impl BleTransport for BluezTransport {
         const FIXED: usize = 3 + 18;
         let mut adv = Advertisement {
             service_uuids: [service].into_iter().collect(),
+            // Do not inherit the desktop adapter's usually-hidden state.
+            // Scope discoverability to this LE advertisement, not BR/EDR.
+            discoverable: Some(true),
             ..Default::default()
         };
         if let Some(token) = transient_token() {
@@ -1228,7 +1231,7 @@ fn expire_pending(pending: &mut HashMap<Address, PendingHalf>) {
     }
 }
 
-/// Duty-cycled LE scanning filtered by the configured service UUID.
+/// Duty-cycled LE scanning with service UUID admission in [`handle_seen`].
 ///
 /// Explicit transitions: each cycle sets the discovery filter, starts a
 /// bounded discovery window, then stops scanning for the remainder of the
@@ -1257,7 +1260,6 @@ async fn scan_task(inner: Arc<Inner>) {
     let cancel = inner.shutdown_token.clone();
     let window = inner.settings.scan_window;
     let interval = inner.settings.scan_interval;
-    let service = inner.settings.scan_service_uuid;
     let mut queued = SeenQueue::default();
 
     loop {
@@ -1266,12 +1268,13 @@ async fn scan_task(inner: Arc<Inner>) {
         // filter/startup call from a window that saw no events.
         log::debug!("blendr-bluez: scan cycle start");
 
-        // Stage the filter in the session's filter map. Failing here means
-        // the next StartDiscovery would send a stale or empty (match-any)
-        // filter, flooding the window with every in-range device — so skip
-        // the cycle instead of scanning unfiltered.
+        // Restrict BlueZ to LE, but leave its UUID list empty. BlueZ 5.87
+        // can call a UUID string as a function when a filter matches:
+        // https://github.com/bluez/bluez/issues/2282
+        // handle_seen enforces our service UUID and RSSI checks instead;
+        // the bounded queue/concurrency contain unrelated BLE sightings.
+        // If setup fails, skip this cycle rather than use stale settings.
         let filter = DiscoveryFilter {
-            uuids: [service].into_iter().collect(),
             transport: DiscoveryTransport::Le,
             ..Default::default()
         };

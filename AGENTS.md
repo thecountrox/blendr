@@ -12,8 +12,9 @@ features for implemented behavior.
   atomic settings writes, doctor diagnostics, and CI.
 - Phase 1: implemented and verified — decentralized identity, encrypted keystore,
   SQLite persistence, and local CLI workflows.
-- Phase 2: transport software implemented; two-device hardware acceptance is
-  pending. User Pi/Arch trials exposed intermittent, asymmetric discovery.
+- Phase 2: transport software implemented; full two-device hardware acceptance
+  is pending. Paired Pi/Arch discovery passed a 35-second run after moving UUID
+  filtering into Blendr; diagnostic-frame exchange and election remain unverified.
 - Phases 3–8: not implemented. Secure sessions, HPKE addressed messaging, broadcast
   sync, mesh forwarding, Android interoperability, and protocol freeze are pending.
   No Kotlin/Compose app, Android BLE adapter, JNI bridge, or Android Keystore
@@ -35,9 +36,10 @@ features for implemented behavior.
 - `crates/blendr-transport`: bounded versioned fragmentation/reassembly,
   cancellation, timeout recovery, and an in-memory radio with loss, delay,
   disconnection, range changes, bounded queues, and connection election.
-- `crates/blendr-bluez`: service-only advertising, filtered discovery, GATT
-  client/server packet IO, runtime packet MTU, retries, and shutdown lifecycle.
-  Client transfer and election have not been exercised against a second device.
+- `crates/blendr-bluez`: service-only advertising, application-filtered discovery,
+  GATT client/server packet IO, runtime packet MTU, retries, and shutdown lifecycle.
+  Paired discovery passed; client transfer attempts have failed and connection
+  election has not been verified against a second device.
 - `apps/linux-cli`: `doctor`, `init`, `identity show|rename|export|import`, `note`,
   and searchable `inbox`. Notes remain local-only. There is no node application
   implementing `start`, `peers`, `send`, `publish`, or `mesh`.
@@ -73,11 +75,13 @@ compiler, clippy, test, and runtime evidence are the available verification.
 
 ## Hardware acceptance status
 
-The agent environment exposes only one Linux controller. The user is now testing
-a Raspberry Pi and an Arch Linux laptop on separate machines, but those machines
-are not remotely accessible to the agent. Two-device discovery, bidirectional
-fragmented GATT transfer, actual negotiated peer MTUs, connection election, and
-both controllers' scheduling behavior remain acceptance criteria.
+The local environment exposes one Linux controller. The Raspberry Pi is now
+remotely accessible with `ssh -i ~/.ssh/tvpi pi@tvpi.local`, with its checkout at
+`/home/pi/blendr` (fallback address: `192.168.1.50`). Both devices pass `doctor`.
+Paired discovery passed a 35-second simultaneous scan/advertise run after the
+application-side UUID-filter workaround. Bidirectional fragmented GATT transfer,
+Blendr packet MTUs, connection election, and sustained discovery reliability
+remain acceptance criteria.
 
 Hardware acceptance is not a prerequisite for implementing later software.
 Later phases have not been implemented; do not claim Phase 2 acceptance complete
@@ -124,22 +128,140 @@ Disabled-advertising startup exited 1 after cleanup without a false watching
 status. New diagnostic logs from both user devices are still needed to
 distinguish actual radio/controller behavior from candidate rejection.
 
-## Paired hardware diagnostic access attempt
+## SSH-coordinated Pi/Arch trials (2026-10-18)
 
-The user authorized SSH to the Pi and supplied its repository location.
-The session host was at revision `dd4fab2`. Local doctor prerequisites and
-all 89 workspace tests passed. A fresh 20-second real BlueZ probe registered
-GATT, advertised the service, completed two scan windows, and shut down cleanly.
-It reported zero Blendr peers; cached candidates failed service/RSSI admission.
+SSH access with the explicit Pi key succeeded. Pi BlueZ is 5.66; laptop BlueZ
+is 5.87. Probe source SHA-256 matched across checkouts; this does not establish
+that the complete source trees or compiled binaries match.
 
-Remote access did not reach authentication: the supplied multicast hostname
-failed DNS and multicast resolution, and SSH to the supplied LAN fallback
-failed with no route to host and failed neighbour resolution. A previously
-known overlay hostname also failed resolution and had no current peer entry.
-No private keys were read or changed, and no Pi source/configuration was changed.
+- Simultaneous 35-second discovery with the original 3-second scan windows:
+  zero peers on both hosts. The laptop logged two `start discovery: Bluetooth
+  operation in progress: Operation already in progress` warnings.
+- Temporary configs used a 60-second scan window and 61-second interval,
+  leaving the original configs unchanged. With Pi listening for 40 seconds and
+  laptop sending after 20 seconds, the Pi discovered one peer with matching
+  service UUID and live RSSI, then lost it; the laptop discovered none.
+- Reversing the 40-second listener and 20-second sender roles found zero peers
+  on both hosts. Neither long-window trial established a link or exchanged a
+  diagnostic frame. Scan-start warnings did not recur in those trials.
+- All probes reported clean shutdown. Final independent D-Bus checks on both
+  controllers returned `Discovering=false` and `ActiveInstances=0`. Temporary
+  configs were removed by the experiment scripts.
 
-Synchronized discovery, Pi prerequisites/revision inspection, and fragmented
-transfers in either direction could not be run. Raw HCI capture was not run;
-passwordless sudo was unavailable locally. These are access limitations, not
-proof that either BLE controller failed. Resume when the Pi is reachable from
-the actual session host; confirm physical BLE proximity independently of SSH.
+Discovery remains intermittent/asymmetric; the radio-level cause is unresolved.
+The probe's `single-controller run` text also appears when two active devices
+fail discovery, and exit code zero does not imply paired-test success.
+
+### Controller tracing and role isolation
+
+The user confirmed that the devices are physically close. Pi `sudo -n` permits
+`btmon`; the laptop denies unprivileged HCI monitoring and requires a password
+for sudo. No adapter resets, pairing approvals, or system configuration changes
+were performed.
+
+The transport source checksums also matched before the experiment.
+`start_advertising` now sets `Advertisement.discoverable = Some(true)` instead
+of inheriting the adapter's hidden state. The change was deployed and built in
+both checkouts. Pi HCI/MGMT observation confirmed a 21-byte advertisement with
+flags `0x06` (LE General Discoverable, BR/EDR Not Supported), replacing the
+previous 18-byte UUID-only payload. This corrects the advertisement flags; it
+did not by itself fix paired discovery.
+
+With temporary configs, laptop advertising without scanning allowed the Pi to
+discover it repeatedly and keep it live for a 30-second run. Laptop concurrent
+scanning/advertising did not discover the advertising-only Pi. A native
+`bluetoothctl scan le` with no laptop advertisement did expose a Blendr device
+with live RSSI (-78 dBm). These comparisons suggest a dual-role or daemon
+lifecycle problem but do not isolate its cause.
+
+Two Pi-initiated probe exchanges against a non-scanning laptop listener timed
+out. HCI tracing of the second showed a successful ACL connection, ATT MTU 517,
+and Blendr GATT service discovery. Subsequent SMP pairing received a negative
+user-confirmation reply and failed; the laptop then disconnected. Both hosts'
+BlueZ logs reported `No agent available for request type 2` and
+`device_confirm_passkey: Operation not permitted`. No application diagnostic
+frame was exchanged. ATT MTU negotiation is not proof of Blendr packet IO.
+
+The laptop journal also records repeated `bluetoothd` SIGSEGV/core-dump exits
+and automatic restarts during the diagnostic period. These invalidate simple
+inferences from successful registration messages; the crash cause is not
+established. The Pi journal also records a SIGSEGV after the connection trials.
+Its adapter object was briefly unavailable after a later daemon start, then
+reappeared powered on. Final D-Bus checks on both hosts confirmed scanning off,
+zero active advertisements, and global discoverability off.
+
+Laptop `coredumpctl info 300683` confirms SIGSEGV/SEGV_ACCERR, but the stored
+root-owned core is inaccessible and the journal stack has no resolved symbols.
+Privileged crash inspection is a remaining prerequisite. Do not silently add
+an auto-accept pairing agent or declare the two-device acceptance passed.
+
+Verification of the advertisement change: both probe builds, workspace format
+check, blendr-bluez all-target clippy with warnings denied, and all six
+blendr-bluez unit tests passed. The hardware smoke verified advertisement flags,
+not reliable simultaneous discovery or frame exchange. No Rust language server
+is configured in this session.
+
+### Laptop discovery crash identified from the user-provided core
+
+The user supplied GDB backtrace, mappings, and instruction bytes for PID 300683.
+The crash address contains the ASCII bytes of Blendr's filter UUID
+`c2f60001-e7ca-4ac2-b6cd-10d5c0bf0001`, interpreted as instructions.
+Installed `bluetoothd` disassembly at relative return address `0x1118a1`
+shows the preceding indirect callback call; its caller at `0xcac26` passes
+list data as the callback and a code address as the match data.
+
+This matches BlueZ issue https://github.com/bluez/bluez/issues/2282:
+5.87's `is_filter_match()` retained `g_slist_find_custom` argument order when
+switching to `queue_find`, calling a UUID string as a function when a matching
+advertisement arrives. Upstream fixed the argument order and boolean equality
+semantics in commit
+https://github.com/bluez/bluez/commit/82af2beafc39510e2c4a439bf44faea711d6503f.
+
+The laptop has CachyOS `bluez`, `bluez-libs`, and `bluez-utils` 5.87-2.1.
+The cached package databases offer CachyOS 5.87-2.1 and Arch 5.87-2; repository
+metadata was not refreshed and no system packages were changed. Both configured
+debuginfod endpoints returned 404 for this binary's build ID.
+
+This supersedes the hypothesis that the laptop's failure to discover while
+advertising establishes a controller dual-role limitation: the UUID-filter
+crash explains why native unfiltered scanning can succeed while Blendr fails.
+Do not rerun UUID-filtered discovery on the affected daemon.
+The Pi 5.66 crash and pairing rejection remain separate unresolved findings;
+this 5.87 regression does not explain them. No further privileged core access
+is needed to identify the laptop's matching UUID-filter crash.
+
+### Application-side UUID discovery workaround
+
+`scan_task` now requests LE discovery with an empty BlueZ UUID list on all
+versions. `handle_seen` retains the configured service-UUID and RSSI checks.
+Advertisements, GATT UUIDs, scan timing, peer aging, pairing policy, the
+256-address pending queue, and four-evaluation concurrency limit are unchanged.
+No BlueZ-version special case or fallback mode was added.
+
+Local verification passed workspace formatting, blendr-bluez all-target clippy
+with warnings denied, all 89 workspace tests, and the probe example build.
+A 25-second live hci0 smoke exercised three scan windows. BlueR trace confirmed
+successful `SetDiscoveryFilter` calls with `UUIDs=[]` and `Transport="le"`.
+Candidates with `service_match=false` and `live_rssi=true` were observed but
+not admitted: zero Blendr peers were reported. The Bluetooth daemon PID remained
+303053 and its restart count stayed zero. Probe shutdown was clean; independent
+D-Bus checks confirmed `Discovering=false` and `ActiveInstances=0`.
+
+The Pi was initially unreachable during implementation: `tvpi.local` failed
+name resolution, SSH to `192.168.1.50` timed out, and two ping requests received
+no replies. Access subsequently returned and the workaround was deployed to
+`/home/pi/blendr`; its probe example build passed.
+
+A simultaneous 35-second discovery run using both original configs passed:
+each host discovered one distinct peer and retained one live peer at completion.
+Both hosts completed four scan windows, and BlueR traces confirmed empty UUID
+filters with LE transport. Matching-service/live-RSSI evaluations occurred on
+both hosts; unrelated live candidates were also evaluated and rejected.
+Laptop bluetoothd PID 303053 and Pi PID 469 remained unchanged, with restart
+counts zero before and after. Both probes exited zero with clean shutdown;
+independent D-Bus checks on both hosts confirmed scanning off and zero active
+advertisements.
+
+This verifies paired discovery for this run, not dense-environment throughput
+or sustained reliability. Diagnostic-frame exchange was not repeated in this
+run, and the previously observed pairing failure remains unresolved.
