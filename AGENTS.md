@@ -618,3 +618,38 @@ the same documented temporary Pi MIDI-plugin isolation
 
 All broadcasts moved exactly one hop under `features.broadcast_mode=true`
 on both nodes; `mesh` forwarding remains unimplemented.
+
+### Service-scoping investigation: daemon GATT probing cannot be filtered (2026-10-25)
+
+Question: could application-side service discovery scoping avoid the MIDI/SMP
+teardown, removing the need for `--noplugin=midi`?
+
+Findings, verified against source and empirically:
+
+- `acquire_client_io` in `crates/blendr-bluez/src/lib.rs` is already scoped:
+  it iterates resolved services, selects only the Blendr service UUID,
+  checks only the RX/TX characteristics, and reads no other attributes.
+- The MIDI read is daemon-internal: `strings bluetoothd` shows
+  `MIDI GATT Driver profile probe`, `org.bluez.GattProfile1`, and
+  `device_accept_gatt_profiles`. On every `Device1.Connect`, BlueZ's own
+  GATT client profiles attach after `ServicesResolved` and probe matching
+  characteristics — no D-Bus or application path can exclude a profile or
+  scope that attach.
+- `Device1.ConnectProfile(uuid)` is not a fallback: per
+  `doc/org.bluez.Device.rst` it connects a *registered btd_profile*; an
+  arbitrary GATT service UUID isn't one (`br-connection-profile-unavailable`
+  on a direct `bluetoothctl` call; the method call also errored on the Pi's
+  `Device1` for this device). `GattProfile1` registration is the reverse
+  direction (auto-connect *our* app on remote sightings), not a filter.
+- A plain `bluetoothctl connect` reproduced daemon-only behavior without
+  the app: it went BR/EDR (SDP, a2dp profile attach) rather than LE, which
+  additionally shows `Connect` fan-out is broader than the GATT profile path.
+- Conclusion: `--noplugin=midi` removes a daemon-internal component, not an
+  application artifact; it is the supported and only clean fix for our own
+  nodes. Alternatives (auto-accept pairing agent, persistent config) are
+  either security-sensitive or out of scope.
+
+Note: the laptop's MIDI characteristic `f36b109d-66f2-a9a1-1241-6838dbe57277`
+is a nonstandard UUID; the Pi's MIDI plugin probed it because it is a
+GATT-profile client for MIDI-class services, not because it enumerated our
+service list differently.
