@@ -1,0 +1,22 @@
+[package]
+name = "blendr-messaging"
+version = "0.1.0"
+edition = "2024"
+description = "Authenticated persistent direct messaging for Blendr nodes"
+license = "MIT"
+
+[dependencies]
+blendr-config = { path = "../blendr-config" }
+blendr-identity = { path = "../blendr-identity" }
+blendr-protocol = { path = "../blendr-protocol" }
+blendr-storage = { path = "../blendr-storage" }
+blendr-transport = { path = "../blendr-transport" }
+serde_json = "1"
+thiserror = "2"
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

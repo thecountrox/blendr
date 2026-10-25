@@ -17,10 +17,15 @@ features for implemented behavior.
   diagnostic runs. Full hardware acceptance remains conditional: transfers used
   temporary Pi MIDI-plugin isolation, and later Pi-initiated connections failed
   below ATT. See the current acceptance evidence and blockers below.
-- Phases 3–8: not implemented. Secure sessions, HPKE addressed messaging, broadcast
-  sync, mesh forwarding, Android interoperability, and protocol freeze are pending.
-  No Kotlin/Compose app, Android BLE adapter, JNI bridge, or Android Keystore
-  integration exists.
+- Phase 3: implemented and verified locally — Noise XX authenticated sessions
+  bound to signed BIS documents, canonical-CBOR frames, HPKE addressed
+  envelopes, distinct link/destination receipts, durable direct outbox,
+  TOFU peer pinning/verify/block, and the `start`/`peers`/`send`/`inbox`
+  CLI. Verified over `MemoryTransport` end-to-end and CLI smoke on hci0;
+  cross-device secure messaging on real hardware is not yet run.
+- Phases 4–8: not implemented. Broadcast sync, mesh forwarding, Android
+  interoperability, and protocol freeze are pending. No Kotlin/Compose app,
+  Android BLE adapter, JNI bridge, or Android Keystore integration exists.
 
 ## Implemented components
 
@@ -31,10 +36,29 @@ features for implemented behavior.
   canonical-CBOR signed identity documents, monotonic profile versions, X25519
   encryption-key epochs, transcript-bound proofs, and Argon2id/XChaCha20-Poly1305
   encrypted keystores with owner-only files and no-overwrite creation.
-- `crates/blendr-storage`: SQLite migrations, all ten planned persistence entities,
-  single-owner identity, monotonic profile history, transactional private notes,
-  deduplication, and literal substring search. Primary history is separate from
-  relay custody; forwarding APIs are not implemented.
+- `crates/blendr-storage`: SQLite migrations, all ten planned persistence
+  entities, single-owner identity, monotonic profile history, transactional
+  private notes, deduplication, and literal substring search. `direct.rs` adds
+  TOFU-pinned peers with monotonic document updates, social trust
+  (unverified/verified/blocked), a durable direct outbox, ciphertext-only
+  inbound history, and distinct link/destination receipt state. Relay
+  forwarding APIs are still not implemented.
+- `crates/blendr-protocol`: Noise XX (`Noise_XX_25519_ChaChaPoly_SHA256`) over
+  `PeerLink` with per-endpoint 32-byte nonces; signed BIS document + proof
+  binding BID, role, handshake transcript, nonces, and the Noise static key
+  (which is the document's X25519 encryption key). Authenticated capability
+  exchange and initiator confirmation precede any application frame.
+  Canonical-CBOR codec rejects nonminimal/indefinite/extra input before
+  allocating. HPKE (X25519/SHA-256/ChaCha20-Poly1305) protects persisted
+  addressed envelopes; receipts are Ed25519-signed per message/kind.
+  snow's `use-getrandom` feature is REQUIRED — without it `local_private_key`
+  fails with `Init(GetRngImpl)` at runtime and every handshake errors.
+- `crates/blendr-messaging`: `Node` orchestrates queue → authenticate →
+  alternating send/receive turns → goodbye drain on any `PeerLink`. Outbox
+  selection respects negotiated per-session count/byte budgets; incoming
+  plaintext is validated then discarded (ciphertext-only at rest); receipts
+  issue only after durable dedup commit. `history` decrypts on read without
+  enforcing TTL so expiry never erases personal history.
 - `crates/blendr-transport`: bounded versioned fragmentation/reassembly,
   cancellation, timeout recovery, and an in-memory radio with loss, delay,
   disconnection, range changes, bounded queues, and connection election.
@@ -43,9 +67,13 @@ features for implemented behavior.
   tracking, and election-safe shutdown. Physical transfer and election evidence
   exists under the documented diagnostic isolation; unrestricted reliability
   is not established.
-- `apps/linux-cli`: `doctor`, `init`, `identity show|rename|export|import`, `note`,
-  and searchable `inbox`. Notes remain local-only. There is no node application
-  implementing `start`, `peers`, `send`, `publish`, or `mesh`.
+- `apps/linux-cli`: `doctor`, `init`, `identity show|rename|export|import`,
+  `note`, `start --duration/--once`, `peers [--scan] [verify|block|unblock]`,
+  `send --to BID [--queue-only]`, and a merged `inbox` (notes + direct
+  history, `--peer`/`--direct`/`--search`). One sequential event loop runs a
+  single exchange at a time with a 60 s per-locator redial cooldown; the
+  BlueZ adapter handles simultaneous-dial election. No `publish` or `mesh`
+  command exists.
 
 ## Verification evidence
 
@@ -387,3 +415,53 @@ Final formatting, workspace all-target clippy with warnings denied, all 94 tests
 and all-target builds passed. The Pi built the demo and passed its two
 message-boundary/malformed-frame tests. Sources and executable are deployed to
 `/home/pi/blendr`; the temporary MIDI override is deliberately not left active.
+
+## Phase 3 secure sessions and direct messaging (2026-10-25)
+
+`crates/blendr-protocol`, `crates/blendr-messaging`, `storage::direct`, and the
+`network` CLI module implement Phase 3. The prior session left this work
+uncommitted mid-implementation; completing it required three fixes found here:
+
+1. `rusqlite` has no `FromSql` for `usize`; `pending_direct_messages` now reads
+   the envelope length as `i64` and converts with `usize::try_from`.
+2. snow's `use-getrandom` feature was missing. Without it `Builder::
+   local_private_key` returns `Init(GetRngImpl)`, every `authenticate` failed
+   with `Error::Authentication`, and the cancelled-token test failed first
+   because builder errors preceded the link IO. Verified by reproducing a raw
+   snow XX exchange over `MemoryTransport` before and after the feature.
+3. `apps/linux-cli/src/network.rs` did not exist at all; `main.rs` already
+   dispatched to it. It now hosts the sequential node event loop (discovery +
+   accept + 60 s per-locator redial + Ctrl-C) shared by `start`,
+   `peers --scan`, and `send`.
+
+Verification:
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked
+  -- -D warnings`, `cargo test --workspace --all-targets --locked` (116 tests,
+  13 suites, all pass), and `cargo build --workspace --all-targets --locked`.
+- New `blendr-messaging/tests/exchange.rs` (3 tests) proves two real
+  `Node::exchange` sessions over `MemoryTransport`: mutual authentication and
+  pinning, 2+1 queued messages delivered bidirectionally with destination
+  receipts, ciphertext-only inbound rows, decryptable history for both sides,
+  `expected_peer` impostor rejection, `blocked_bids` rejection, locally
+  blocked queue rejection, and oversize/unknown-recipient queue failures.
+- Existing protocol tests cover tampered/duplicated/reordered/cross-session
+  replayed ciphertext, policy fail-closed, cancellation dropping live
+  cipher+link, the full signed-binding test matrix, and an RFC 9180 HPKE
+  vector.
+- CLI smoke on hci0 (fresh temp config): `init`, `note`, `identity show`,
+  `peers` (empty listing), `inbox` merged view with `--direct` and `--search`,
+  self/unknown-recipient send rejection (exit 1), bad-fingerprint verify
+  rejection, `start --duration 4` advertised/scanned and exited 0 with clean
+  shutdown (Discovering=false, ActiveInstances=0 afterward), and
+  `peers --scan --duration 3` completed a scan window and listed peers.
+- `config.json` `transport.ble.max_frame_payload_bytes` raised 128 → 8192:
+  secure sessions require >= 1024 and the 4 KiB text default needs headroom
+  for envelope overhead. Pi checkout does NOT yet carry this phase's code;
+  deploy before any cross-device secure trial.
+
+Not verified: any real-hardware secure session, `send` delivery against a
+live peer, or `start` exchange against a second node — requires the second
+physical device. The known Pi-initiated `le-connection-abort-by-local`
+failures and daemon crashes documented above remain unresolved blockers for
+hardware acceptance.

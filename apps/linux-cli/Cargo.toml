@@ -10,9 +10,17 @@ blendr-config = { path = "../../crates/blendr-config" }
 clap = { version = "4", features = ["derive"] }
 blendr-identity = { path = "../../crates/blendr-identity" }
 blendr-storage = { path = "../../crates/blendr-storage" }
+blendr-messaging = { path = "../../crates/blendr-messaging" }
+blendr-protocol = { path = "../../crates/blendr-protocol" }
+blendr-transport = { path = "../../crates/blendr-transport" }
+blendr-bluez = { path = "../../crates/blendr-bluez" }
+tokio = { version = "1", features = ["rt", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+env_logger = { version = "0.11", default-features = false }
 rpassword = "7"
 zeroize = "1"
 serde_json = "1"
+uuid = "1"
 
 [[bin]]
 name = "blendr"

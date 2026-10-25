@@ -6,5 +6,7 @@ members = [
     "crates/blendr-storage",
     "crates/blendr-transport",
     "crates/blendr-bluez",
+    "crates/blendr-protocol",
+    "crates/blendr-messaging",
 ]
 resolver = "3"

@@ -333,6 +333,13 @@ impl Identity {
             .map(|e| &e.secret)
     }
 
+    /// Sign a canonical, domain-separated protocol payload without exporting
+    /// signing key material. Callers must include their protocol/version domain
+    /// in the payload; identity documents and session proofs have separate domains.
+    pub fn sign_protocol_payload(&self, payload: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(payload).to_bytes()
+    }
+
     /// Sign a fresh session challenge, binding the proof to this BID, the
     /// link `role` (e.g. `"initiator"`/`"responder"`), the running handshake
     /// `transcript_hash`, and both peers' `nonces`. Returns the raw 64-byte

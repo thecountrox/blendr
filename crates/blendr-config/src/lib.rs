@@ -202,14 +202,14 @@ pub struct SharingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcknowledgementsConfig {
-    link_receipt: bool,
+    pub link_receipt: bool,
     pub destination_delivery_receipt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessagingConfig {
-    max_text_utf8_bytes: u64,
+    pub max_text_utf8_bytes: u64,
     pub default_message_ttl_seconds: u64,
     pub sharing: SharingConfig,
     pub acknowledgements: AcknowledgementsConfig,

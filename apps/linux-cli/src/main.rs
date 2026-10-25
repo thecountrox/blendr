@@ -1,15 +1,15 @@
 //! blendr — Linux CLI for the Blendr local-first BLE messenger.
 //!
-//! Phase 0 implemented `blendr doctor` (config validation + Linux BLE
-//! prerequisite checks). Phase 1 adds the local identity/storage workflow:
-//!
+//! * `blendr doctor` — config validation + Linux BLE prerequisite checks.
 //! * `blendr init` — create data directories, an encrypted keystore, and the
 //!   SQLite database without ever overwriting an existing identity. Re-running
 //!   on a fully initialized node verifies consistency and is a no-op.
 //! * `blendr identity show|rename|export|import` — inspect, rename, and
 //!   back up / restore the local identity.
-//! * `blendr note` / `blendr inbox` — private local notes; never shared or
-//!   relayed.
+//! * `blendr note` / `blendr inbox` — private local notes and decrypted
+//!   direct-message history.
+//! * `blendr start|peers|send` — authenticated Noise XX sessions, peer
+//!   pinning/trust, and addressed direct messaging over BLE (see `network`).
 //!
 //! Secrets policy: passphrases are only ever read from the terminal
 //! (rpassword) or from `--passphrase-file`/`--backup-passphrase-file` files
@@ -17,6 +17,7 @@
 //! values, environment variables, or in error messages.
 
 mod doctor;
+mod network;
 mod secrets;
 
 use std::fmt;
@@ -40,7 +41,7 @@ const INBOX_LIMIT_MAX: u32 = 500;
 /// `messaging.max_text_utf8_bytes` ceiling.
 const MAX_NOTE_BYTES: usize = 64 * 1024;
 
-/// Local-first, proximity BLE messaging — Linux CLI (Phase 1 prototype).
+/// Local-first, authenticated proximity messaging over Bluetooth LE.
 #[derive(Parser)]
 #[command(name = "blendr", version, about, long_about = None)]
 struct Cli {
@@ -92,6 +93,40 @@ enum Commands {
         command: IdentityCommands,
     },
 
+    /// Run a foreground authenticated BLE node (Ctrl-C to stop).
+    Start {
+        /// Stop after SECONDS; otherwise run until interrupted.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        duration: Option<u64>,
+        /// Exit after one successful authenticated exchange.
+        #[arg(long)]
+        once: bool,
+    },
+
+    /// List authenticated known peers or manage their pinned identities.
+    Peers {
+        /// Discover and authenticate nearby nodes before listing stored peers.
+        #[arg(long)]
+        scan: bool,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        duration: u64,
+        #[command(subcommand)]
+        action: Option<PeerCommands>,
+    },
+
+    /// Encrypt and durably queue a direct message for a known full BID.
+    Send {
+        #[arg(long, value_name = "BID")]
+        to: String,
+        /// Message text; command-line text is visible in shell history.
+        text: String,
+        /// Queue only, without opening Bluetooth.
+        #[arg(long)]
+        queue_only: bool,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: u64,
+    },
+
     /// Store a private local note. Notes are never published, synced, or
     /// relayed; they stay inside the local database.
     Note {
@@ -99,16 +134,36 @@ enum Commands {
         text: String,
     },
 
-    /// List local private notes, newest first.
+    /// List private notes and decrypted direct-message history, newest first.
     Inbox {
-        /// Only show notes whose text contains QUERY (case rules follow the
-        /// storage engine).
+        /// Literal substring search (ASCII case-insensitive).
         #[arg(long, value_name = "QUERY")]
         search: Option<String>,
         /// Maximum number of notes to list (1..=500).
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=INBOX_LIMIT_MAX as i64))]
         limit: u32,
+        /// Only show direct messages with this full BID.
+        #[arg(long, value_name = "BID")]
+        peer: Option<String>,
+        /// Exclude local-only notes.
+        #[arg(long)]
+        direct: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PeerCommands {
+    /// Mark a peer verified after comparing its signing key out of band.
+    Verify {
+        bid: String,
+        /// Exact 64-hex-character signing key from the other device's identity show.
+        #[arg(long)]
+        fingerprint: String,
+    },
+    /// Reject this peer's sessions and outgoing direct messages.
+    Block { bid: String },
+    /// Remove the local block; manual verification must be repeated.
+    Unblock { bid: String },
 }
 
 #[derive(Subcommand)]
@@ -202,7 +257,24 @@ fn main() -> ExitCode {
             } => cmd_identity_import(&cli, path, backup_passphrase_file.as_deref()),
         },
         Commands::Note { ref text } => cmd_note(&cli, text),
-        Commands::Inbox { ref search, limit } => cmd_inbox(&cli, search.as_deref(), limit),
+        Commands::Start { duration, once } => network::start(&cli, duration, once),
+        Commands::Peers {
+            scan,
+            duration,
+            ref action,
+        } => network::peers(&cli, scan, duration, action.as_ref()),
+        Commands::Send {
+            ref to,
+            ref text,
+            queue_only,
+            timeout,
+        } => network::send(&cli, to, text, queue_only, timeout),
+        Commands::Inbox {
+            ref search,
+            limit,
+            ref peer,
+            direct,
+        } => network::inbox(&cli, search.as_deref(), limit, peer.as_deref(), direct),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -819,25 +891,4 @@ fn cmd_note(cli: &Cli, text: &str) -> Result<(), Fail> {
             Err(e) => return Err(runtime(format!("cannot store note: {e}"))),
         }
     }
-}
-
-fn cmd_inbox(cli: &Cli, search: Option<&str>, limit: u32) -> Result<(), Fail> {
-    let (config, paths) = load_node(&cli.config)?;
-    let passphrase =
-        secrets::existing_passphrase(cli.passphrase_file.as_deref(), "keystore passphrase")?;
-    let (_identity, store) = open_node(&config, &paths, passphrase.as_str())?;
-    let notes = store
-        .local_messages(search, limit)
-        .map_err(|e| runtime(format!("cannot read inbox: {e}")))?;
-    if notes.is_empty() {
-        match search {
-            Some(q) => println!("no local notes matching `{q}`"),
-            None => println!("no local notes"),
-        }
-        return Ok(());
-    }
-    for note in &notes {
-        println!("{}  {}  {}", note.created_at_ms, note.id, note.text);
-    }
-    Ok(())
 }

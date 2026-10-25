@@ -1,0 +1,27 @@
+[package]
+name = "blendr-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Authenticated Noise sessions, canonical direct-message envelopes and receipts"
+license = "MIT"
+
+[dependencies]
+blendr-identity = { path = "../blendr-identity" }
+blendr-transport = { path = "../blendr-transport" }
+data-encoding = "2"
+ed25519-dalek = "3"
+getrandom = "0.4"
+hpke = { version = "0.13", default-features = false, features = ["std", "x25519"] }
+minicbor = { version = "2.3", features = ["std"] }
+rand = "0.9"
+sha2 = "0.11"
+snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = "1"
+zeroize = "1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

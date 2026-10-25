@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS encounters (
 
 -- ---------------------------------------------------------------------------
 -- messages: the node's primary personal history — locally originated private
--- notes and (in later phases) received/sent addressed or broadcast envelopes.
+-- notes, received/sent addressed envelopes, and future broadcast envelopes.
 --
 -- `message_id` is globally unique and deduplication-anchored: inserting the
 -- same ID with identical content is a no-op, inserting different content for
@@ -83,9 +83,9 @@ CREATE TABLE IF NOT EXISTS encounters (
 --
 -- `visibility = 'private'` + `destination_bid IS NULL` marks a local-only note:
 -- such rows are never eligible for advertisement, inventory, or relay.
--- `signed_envelope` holds the full signed wire envelope once protocol support
--- lands; `body` holds plaintext only for locally authored notes (remote
--- addressed messages stay ciphertext-only).
+-- `signed_envelope` holds the full signed wire envelope; `body` holds plaintext
+-- only for locally authored notes and locally authored direct messages.
+-- Received addressed messages stay ciphertext-only, including after delivery.
 --
 -- IMPORTANT: nothing cascades INTO this table from relay_queue. Deleting a
 -- message deletes its queue/dedup/ledger bookkeeping, never the reverse —
@@ -154,8 +154,9 @@ CREATE TABLE IF NOT EXISTS seen_messages (
 );
 
 -- ---------------------------------------------------------------------------
--- peer_delivery_ledger: per-(peer, message) sync accounting so a message is
--- never re-offered or re-transferred to a peer that already has it.
+-- peer_delivery_ledger: per-(peer, message) accounting. A link acknowledgement
+-- does not prove destination acceptance; direct outbox retries stop only once
+-- the distinct destination receipt has been persisted.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS peer_delivery_ledger (
     peer_bid         TEXT NOT NULL REFERENCES peers (bid),

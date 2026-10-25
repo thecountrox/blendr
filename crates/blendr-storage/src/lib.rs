@@ -21,6 +21,10 @@
 //!   an existing ID is a hard conflict, never a silent overwrite.
 //! * **Separation of concerns:** private local notes are never relay-eligible,
 //!   and nothing in `relay_queue` can cascade-delete personal history.
+//!
+//! Authenticated peer documents are TOFU-pinned and monotonic. Direct messages
+//! have a durable outbox and distinct link/destination receipt states; received
+//! messages retain only their encrypted envelope, never decrypted plaintext.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -29,6 +33,12 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
+
+mod direct;
+pub use direct::{
+    DirectMessage, MAX_DIRECT_ENVELOPE_BYTES, MAX_DIRECT_TEXT_BYTES, Peer, ReceiptKind,
+    StoredReceipt, TrustStatus,
+};
 
 /// Schema revision this build can create/migrate to. Bump when adding
 /// migrations to `MIGRATIONS`.

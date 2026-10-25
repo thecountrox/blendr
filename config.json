@@ -31,7 +31,7 @@
       "gatt_rx_characteristic_uuid": "c2f60002-e7ca-4ac2-b6cd-10d5c0bf0001",
       "gatt_tx_characteristic_uuid": "c2f60003-e7ca-4ac2-b6cd-10d5c0bf0001",
       "preferred_mtu": 185,
-      "max_frame_payload_bytes": 128,
+      "max_frame_payload_bytes": 8192,
       "reassembly_timeout_ms": 15000,
       "connection_timeout_ms": 15000,
       "max_concurrent_links": 2,

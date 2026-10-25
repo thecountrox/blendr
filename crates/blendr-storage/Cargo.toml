@@ -6,10 +6,13 @@ description = "Blendr local-first persistence: bundled SQLite schema, migrations
 license = "MIT"
 
 [dependencies]
+blendr-identity = { path = "../blendr-identity" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+uuid = "1"
 
 [dev-dependencies]
+ed25519-dalek = "3"
 tempfile = "3"

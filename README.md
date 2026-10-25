@@ -5,15 +5,15 @@ installation is a self-contained node: identity, messages, and sync state stay
 on the device. There is no server, account, or Internet requirement. The full
 product/protocol specification lives in [`plan.md`](./plan.md).
 
-## Overview
+The Rust workspace provides a Linux CLI for decentralized identities, private
+local notes, authenticated Noise XX sessions, and addressed direct messages
+over Bluetooth LE, plus shared framing, an in-memory radio, and a BlueZ BLE
+adapter.
 
-The Rust workspace provides a Linux CLI for decentralized identities and private
-local notes, plus shared framing, an in-memory radio, and a BlueZ BLE adapter.
-
-Not implemented yet: the `blendr start` node application, peers UI, secure
-sessions, messaging between nodes, mesh, sync, or Android. Private notes are
-local-only. BLE examples exchange only diagnostic frames and are unauthenticated;
-do not use them to transfer private messages.
+Not implemented yet: broadcast sync (`publish`), mesh forwarding, or Android.
+Private notes are still local-only and are never transmitted. The BLE examples
+exchange only unauthenticated diagnostic frames; do not use them for private
+messages.
 
 ## Usage
 
@@ -30,8 +30,18 @@ blendr identity rename "alice"     # signed rename; BID never changes
 blendr identity export backup.enc  # encrypted backup (never overwrites)
 blendr identity import backup.enc  # restore into a node without a keystore
 blendr note "remember this"        # private local note (never synced)
-blendr inbox                       # list notes, newest first
+blendr inbox                       # notes + direct messages, newest first
+blendr inbox --direct --peer BID   # only direct messages with one peer
 blendr inbox --search "rem" --limit 20
+
+blendr start                       # foreground node: advertise, scan, exchange
+blendr start --once --duration 120
+blendr peers                       # list pinned peers and trust status
+blendr peers --scan --duration 60  # discover + authenticate nearby nodes
+blendr peers verify BID --fingerprint HEX64   # out-of-band key check
+blendr peers block BID / unblock BID
+blendr send --to BID "hello"       # encrypt, queue, deliver within --timeout
+blendr send --to BID "hello" --queue-only     # queue only; `start` delivers
 ```
 
 Passphrases are only ever read from the terminal (with confirmation when
@@ -66,6 +76,34 @@ encryption keys are untouched), atomically rewrites `node.display_name` in
 If `config.json`'s display name and the signed document ever disagree (e.g.
 after hand-editing), every operating command refuses with a drift error —
 run `blendr identity rename "<desired name>"` to reconcile.
+
+### Direct messaging semantics
+
+- `blendr peers --scan` runs the node until the deadline: every discovered
+  Blendr peer gets a mutually authenticated Noise XX session bound to its
+  signed identity document. On success the peer is **pinned** (trust on first
+  use); a later session presenting a different signing key for the same BID
+  fails closed.
+- Trust is layered: pinning happens automatically, `peers verify` marks a pin
+  `verified` only after an out-of-band comparison of the exact 64-hex signing
+  key printed by the other device's `identity show`, and `peers block` /
+  `unblock` locally reject sessions and outbound queues (unblocking resets
+  trust to unverified).
+- `blendr send` encrypts the text for the recipient's current X25519 epoch
+  (HPKE), signs the envelope, and stores it in the durable outbox **before**
+  any radio contact. Delivery requires a prior `peers --scan` so the
+  recipient's key is pinned; an unknown or blocked BID fails before queueing.
+- During an authenticated session both nodes exchange queued outbound
+  messages under the negotiated per-session count/byte budget. A *link
+  receipt* proves the peer's transport accepted the frame; a separate
+  *destination receipt* — issued only after durable persistence — is what
+  marks a message `delivered` in history.
+- Received messages are stored ciphertext-only; plaintext is decrypted on
+  `inbox` read and is never persisted, so history survives TTL expiry. Outbox
+  retries continue across sessions until a destination receipt arrives.
+- `inbox` merges private notes (marked `note`) and direct history (`direct
+  ->`/`direct <-` with the peer BID and state) into one newest-first page;
+  `--peer` and `--direct` filter it.
 
 ### `identity export` / `import` semantics
 
@@ -301,13 +339,20 @@ operation with the original daemon configuration.
 
 ## Limitations
 
-- `start`, `peers`, `send`, `publish`, and `mesh` CLI commands do not exist.
-  `note`/`inbox` data is local-only and never leaves the device.
-- The SQLite database is not fully encrypted; private notes are protected
-  only by filesystem permissions (`0600`/`0700`). Private keys, in contrast,
-  are always encrypted at rest.
+- `publish` (broadcast sync) and `mesh` commands do not exist; direct
+  messages are delivered only while the two nodes are in direct BLE range.
+  `note` data never leaves the device.
+- The SQLite database is not fully encrypted; private notes and own outbound
+  text are protected only by filesystem permissions (`0600`/`0700`).
+  Received messages are ciphertext-only at rest. Private keys are always
+  encrypted at rest.
 - Config changes require editing `config.json`; display-name changes must go
   through `blendr identity rename` or commands refuse with a drift error.
+  Secure sessions require `transport.ble.max_frame_payload_bytes >= 1024`.
+- Cross-device secure messaging has not yet been run on real hardware; the
+  adapter-level diagnostics above apply, including known BlueZ/controller
+  failures. `blendr send` delivery semantics are verified in-memory and by
+  test, not yet Pi↔laptop.
 - Identity import never replaces an existing identity; deleting a keystore
   or database to start over is an explicit, manual operation.
 - If none of `busctl`/`dbus-send`/`bluetoothctl` exist, doctor's daemon and
