@@ -43,6 +43,8 @@ blendr peers verify BID --fingerprint HEX64   # out-of-band key check
 blendr peers block BID / unblock BID
 blendr send --to BID "hello"       # encrypt, queue, deliver within --timeout
 blendr send --to BID "hello" --queue-only     # queue only; `start` delivers
+blendr chat --to BID               # interactive texting; replies print live
+blendr chat --to BID --duration 60 --once   # bounded run / single exchange
 
 blendr publish "hello nearby"     # sign + store a public post
 blendr publish "hi" --sync 60     # also share it within the deadline
@@ -110,6 +112,13 @@ run `blendr identity rename "<desired name>"` to reconcile.
 - `inbox` merges private notes (marked `note`) and direct history (`direct
   ->`/`direct <-` with the peer BID and state) into one newest-first page;
   `--peer` and `--direct` filter it.
+- `chat --to BID` is the interactive form of the same store-and-forward
+  protocol, not a persistent socket: each typed line is queued into the
+  durable outbox immediately, then rides the next authenticated exchange
+  (inbound or outbound — the redial gap is ~2 s, so it reads like texting
+  once both nodes are in range). Incoming messages print as they arrive,
+  deduplicated against existing history; `Ctrl-C` exits cleanly and queued
+  lines stay in the outbox for the next session.
 
 ### Broadcast semantics
 

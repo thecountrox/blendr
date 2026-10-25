@@ -99,10 +99,15 @@ features for implemented behavior.
   `note`, `start --duration/--once`, `peers [--scan] [verify|block|unblock]`,
   `send --to BID [--queue-only]`, a merged `inbox`
   (notes + direct history, `--peer`/`--direct`/`--search`), `publish`
-  (`--sync` shares within a deadline), and `feed` (`--search`). One
-  sequential event loop runs a single exchange at a time with a 60 s
-  per-locator redial cooldown; the BlueZ adapter handles simultaneous-dial
-  election. No `mesh` command exists.
+  (`--sync` shares within a deadline), `feed` (`--search`), and
+  `chat --to BID [--once] [--duration]` (interactive direct messaging over
+  the same session loop). One sequential event loop runs a single exchange
+  at a time with a per-locator redial cooldown; the BlueZ adapter handles
+  simultaneous-dial election. The loop's knobs sit in a `Session` struct;
+  `chat` uses a `pre_exchange` hook (stdin → `node.queue` right before each
+  exchange) plus a 2 s redial vs the 60 s default, and prints incoming
+  messages deduplicated by ID seeded from history. Peer must be pinned.
+  No `mesh` command exists.
 
 ## Verification evidence
 
