@@ -79,6 +79,10 @@ struct Session<'a> {
     stop: &'a mut dyn FnMut(&Node, u32) -> bool,
     input: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     on_input: Option<&'a mut InputHook<'a>>,
+    /// Runs after every exchange *attempt* (success or failure) so callers
+    /// can flush received state — e.g. `chat` prints incoming messages even
+    /// when the session dies at goodbye teardown after delivery.
+    after_exchange: Option<&'a mut dyn FnMut(&Node)>,
 }
 
 /// Line handler signature for the stdin-style `input` feed. The object
@@ -202,12 +206,20 @@ async fn event_loop(
         let Some(link) = link else { continue };
         match run_exchange(node, link, session.expected_peer.clone(), cancel).await {
             Ok(()) => {
+                if let Some(hook) = session.after_exchange.as_deref_mut() {
+                    hook(node);
+                }
                 exchanges += 1;
                 if (session.stop)(node, exchanges) {
                     return Ok(LoopEnd::Finished);
                 }
             }
-            Err(e) => warn(format!("exchange: {e}")),
+            Err(e) => {
+                warn(format!("exchange: {e}"));
+                if let Some(hook) = session.after_exchange.as_deref_mut() {
+                    hook(node);
+                }
+            }
         }
     }
 }
@@ -260,6 +272,7 @@ pub(crate) fn start(cli: &Cli, duration: Option<u64>, once: bool) -> Result<(), 
             stop: &mut |_, exchanges| once && exchanges >= 1,
             input: None,
             on_input: None,
+            after_exchange: None,
         },
     ))?;
     match end {
@@ -302,6 +315,7 @@ pub(crate) fn peers(
                 stop: &mut |_, _| false,
                 input: None,
                 on_input: None,
+                after_exchange: None,
             },
         ))?;
         if let LoopEnd::Closed(what) = end {
@@ -428,6 +442,7 @@ pub(crate) fn send(
             stop: &mut |node, _| delivered(node),
             input: None,
             on_input: None,
+            after_exchange: None,
         },
     ))?;
     if delivered(&node) {
@@ -494,8 +509,8 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
         .map(|message| message.id)
         .collect();
     println!("chatting with {name} ({to}); type and press enter, ctrl-c to quit");
-    let mut print_new = |node: &Node| {
-        if let Ok(rows) = node.history(Some(to), None, 100) {
+    let mut print_new = |node: &Node| match node.history(Some(to), None, 100) {
+        Ok(rows) => {
             for message in rows.iter().rev() {
                 if message.outgoing || !shown.insert(message.id.clone()) {
                     continue;
@@ -503,6 +518,7 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
                 println!("{name}: {}", message.text);
             }
         }
+        Err(e) => warn(format!("cannot read history: {e}")),
     };
     let queue_line = |node: &mut Node, text: String| match blendr_messaging::now_ms() {
         Err(e) => warn(format!("cannot queue line: {e}")),
@@ -520,12 +536,10 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
             expected_peer: Some(to.to_string()),
             announce: Some(format!("waiting for {name}")),
             redial: Duration::from_secs(2),
-            stop: &mut |node, exchanges| {
-                print_new(node);
-                once && exchanges >= 1
-            },
+            stop: &mut |_, exchanges| once && exchanges >= 1,
             input: Some(rx),
             on_input: Some(&mut on_input),
+            after_exchange: Some(&mut print_new),
         },
     ))?;
     match end {
@@ -572,6 +586,7 @@ pub(crate) fn publish(cli: &Cli, text: &str, sync: bool, timeout_seconds: u64) -
             },
             input: None,
             on_input: None,
+            after_exchange: None,
         },
     ))?;
     if synced {
