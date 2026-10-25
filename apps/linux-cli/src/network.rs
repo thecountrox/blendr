@@ -66,18 +66,25 @@ fn warn(message: impl std::fmt::Display) {
     eprintln!("blendr: warning: {message}");
 }
 
-/// Create the transport, start advertising, then run the event loop; always
-/// tears the transport down afterward. `stop` ends the run after the given
-/// number of completed exchanges; `expected_peer` restricts every exchange
-/// (and every dial) to one authenticated BID. `announce` prints once
-/// advertising is live, so the status message reflects an actual beacon.
-async fn transport_session(
-    config: &blendr_config::Config,
-    node: &mut Node,
+/// Tunables for one transport session. `expected_peer` restricts every
+/// exchange to one authenticated BID; `pre_exchange` runs once immediately
+/// before each exchange so commands like `chat` can inject fresh outbox
+/// items into the same session that carries them.
+struct Session<'a> {
     duration: Option<Duration>,
     expected_peer: Option<String>,
     announce: Option<String>,
-    stop: &mut dyn FnMut(&Node, u32) -> bool,
+    redial: Duration,
+    stop: &'a mut dyn FnMut(&Node, u32) -> bool,
+    pre_exchange: Option<&'a mut dyn FnMut(&mut Node)>,
+}
+
+/// Create the transport, start advertising, then run the event loop; always
+/// tears the transport down afterward.
+async fn transport_session(
+    config: &blendr_config::Config,
+    node: &mut Node,
+    mut session: Session<'_>,
 ) -> Result<LoopEnd, String> {
     let service: Uuid = config
         .transport
@@ -88,16 +95,7 @@ async fn transport_session(
     let transport = BluezTransport::new(config)
         .await
         .map_err(|e| format!("adapter setup: {e}"))?;
-    let result = session_loop(
-        &transport,
-        node,
-        service,
-        duration,
-        expected_peer,
-        announce,
-        stop,
-    )
-    .await;
+    let result = session_loop(&transport, node, service, &mut session).await;
     let shutdown = tokio::time::timeout(SHUTDOWN_BUDGET, transport.shutdown()).await;
     match shutdown {
         Err(_) => warn("transport shutdown deadline expired"),
@@ -111,10 +109,7 @@ async fn session_loop(
     transport: &BluezTransport,
     node: &mut Node,
     service: Uuid,
-    duration: Option<Duration>,
-    expected_peer: Option<String>,
-    announce: Option<String>,
-    stop: &mut dyn FnMut(&Node, u32) -> bool,
+    session: &mut Session<'_>,
 ) -> Result<LoopEnd, String> {
     let mut peers = transport
         .watch_peers()
@@ -128,21 +123,14 @@ async fn session_loop(
         .start_advertising(service)
         .await
         .map_err(|e| format!("advertising: {e}"))?;
-    if let Some(text) = announce {
+    if let Some(text) = &session.announce {
         println!("{text} (adapter {})", transport.adapter_name());
     }
 
     let cancel = CancellationToken::new();
-    let work = event_loop(
-        transport,
-        node,
-        &mut peers,
-        &mut inbound,
-        &cancel,
-        expected_peer,
-        stop,
-    );
-    if let Some(deadline) = duration {
+    let deadline = session.duration;
+    let work = event_loop(transport, node, &mut peers, &mut inbound, &cancel, session);
+    if let Some(deadline) = deadline {
         match tokio::time::timeout(deadline, work).await {
             Err(_) => Ok(LoopEnd::Deadline),
             Ok(done) => done,
@@ -158,8 +146,7 @@ async fn event_loop(
     peers: &mut tokio::sync::mpsc::Receiver<PeerEvent>,
     inbound: &mut tokio::sync::mpsc::Receiver<Box<dyn PeerLink>>,
     cancel: &CancellationToken,
-    expected_peer: Option<String>,
-    stop: &mut dyn FnMut(&Node, u32) -> bool,
+    session: &mut Session<'_>,
 ) -> Result<LoopEnd, String> {
     let mut attempts: HashMap<PeerLocator, Instant> = HashMap::new();
     let mut exchanges = 0u32;
@@ -170,7 +157,7 @@ async fn event_loop(
                 Some(PeerEvent::Discovered(locator)) => {
                     let recent = attempts
                         .get(&locator)
-                        .is_some_and(|at| at.elapsed() < REDIAL_INTERVAL);
+                        .is_some_and(|at| at.elapsed() < session.redial);
                     if recent {
                         continue;
                     }
@@ -195,10 +182,13 @@ async fn event_loop(
             },
         };
         let Some(link) = link else { continue };
-        match run_exchange(node, link, expected_peer.clone(), cancel).await {
+        if let Some(hook) = session.pre_exchange.as_deref_mut() {
+            hook(node);
+        }
+        match run_exchange(node, link, session.expected_peer.clone(), cancel).await {
             Ok(()) => {
                 exchanges += 1;
-                if stop(node, exchanges) {
+                if (session.stop)(node, exchanges) {
                     return Ok(LoopEnd::Finished);
                 }
             }
@@ -247,10 +237,14 @@ pub(crate) fn start(cli: &Cli, duration: Option<u64>, once: bool) -> Result<(), 
     let end = runtime_on(transport_session(
         &config,
         &mut node,
-        duration.map(Duration::from_secs),
-        None,
-        Some(announce),
-        &mut |_, exchanges| once && exchanges >= 1,
+        Session {
+            duration: duration.map(Duration::from_secs),
+            expected_peer: None,
+            announce: Some(announce),
+            redial: REDIAL_INTERVAL,
+            stop: &mut |_, exchanges| once && exchanges >= 1,
+            pre_exchange: None,
+        },
     ))?;
     match end {
         LoopEnd::Finished => println!("one exchange complete; stopping"),
@@ -284,10 +278,14 @@ pub(crate) fn peers(
         let end = runtime_on(transport_session(
             &config,
             &mut node,
-            Some(Duration::from_secs(duration)),
-            None,
-            Some(format!("scanning for peers ({duration}s)")),
-            &mut |_, _| false,
+            Session {
+                duration: Some(Duration::from_secs(duration)),
+                expected_peer: None,
+                announce: Some(format!("scanning for peers ({duration}s)")),
+                redial: REDIAL_INTERVAL,
+                stop: &mut |_, _| false,
+                pre_exchange: None,
+            },
         ))?;
         if let LoopEnd::Closed(what) = end {
             return Err(runtime(format!("scan stopped early: {what}")));
@@ -405,10 +403,14 @@ pub(crate) fn send(
     let end = runtime_on(transport_session(
         &config,
         &mut node,
-        Some(Duration::from_secs(timeout_seconds)),
-        Some(to.to_string()),
-        Some(format!("waiting for peer {to}")),
-        &mut |node, _| delivered(node),
+        Session {
+            duration: Some(Duration::from_secs(timeout_seconds)),
+            expected_peer: Some(to.to_string()),
+            announce: Some(format!("waiting for peer {to}")),
+            redial: REDIAL_INTERVAL,
+            stop: &mut |node, _| delivered(node),
+            pre_exchange: None,
+        },
     ))?;
     if delivered(&node) {
         println!("delivered {id}");
@@ -423,6 +425,107 @@ pub(crate) fn send(
             "delivery incomplete; message {id} remains queued"
         ))),
     }
+}
+
+/// Interactive direct messaging with one pinned peer.
+///
+/// There is no long-lived BLE session: each line typed becomes one queued
+/// envelope that rides the *next* authenticated exchange (inbound or
+/// outbound). The stdin reader thread owns the terminal; this loop drains
+/// it just before each exchange so a line sent mid-session still makes the
+/// same turn rather than waiting one whole exchange. Incoming history is
+/// printed after every exchange (deduplicated by message ID).
+pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Result<(), Fail> {
+    let (config, mut node) = open_messaging(cli)?;
+    node.settings().validate_network().map_err(messaging_fail)?;
+    let peer = node
+        .store()
+        .peers()
+        .map_err(|e| runtime(format!("cannot list peers: {e}")))?
+        .into_iter()
+        .find(|peer| peer.document.bid == to)
+        .ok_or_else(|| {
+            runtime(format!(
+                "peer {to} is not pinned; run `peers --scan` or `send` first"
+            ))
+        })?;
+    let name = peer.document.display_name.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut line = String::new();
+            match stdin.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = line.trim_end();
+                    if !text.is_empty() && tx.send(text.to_string()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    env_logger::init_from_env(
+        env_logger::Env::default().default_filter_or("off,blendr_bluez=warn"),
+    );
+    let mut shown: std::collections::HashSet<String> = node
+        .history(Some(to), None, 500)
+        .map_err(messaging_fail)?
+        .into_iter()
+        .map(|message| message.id)
+        .collect();
+    println!("chatting with {name} ({to}); type and press enter, ctrl-c to quit");
+    let mut print_new = |node: &Node| {
+        if let Ok(rows) = node.history(Some(to), None, 100) {
+            for message in rows.iter().rev() {
+                if message.outgoing || !shown.insert(message.id.clone()) {
+                    continue;
+                }
+                println!("{name}: {}", message.text);
+            }
+        }
+    };
+    print_new(&node);
+    let queue_line = |node: &mut Node, text: String| match blendr_messaging::now_ms() {
+        Err(e) => warn(format!("cannot queue line: {e}")),
+        Ok(now) => match node.queue(to, &text, now) {
+            Ok(id) => println!("you: {text}  [{id}]"),
+            Err(e) => warn(format!("cannot queue line: {e}")),
+        },
+    };
+    // First drain waits a moment so a piped/just-typed line lands in the
+    // channel before the outbox snap; later drains are nonblocking.
+    if let Ok(text) = rx.recv_timeout(Duration::from_millis(300)) {
+        queue_line(&mut node, text);
+    }
+    let mut drain = |node: &mut Node| {
+        while let Ok(text) = rx.try_recv() {
+            queue_line(node, text);
+        }
+    };
+    let end = runtime_on(transport_session(
+        &config,
+        &mut node,
+        Session {
+            duration: duration.map(Duration::from_secs),
+            expected_peer: Some(to.to_string()),
+            announce: Some(format!("waiting for {name}")),
+            redial: Duration::from_secs(2),
+            stop: &mut |node, exchanges| {
+                print_new(node);
+                once && exchanges >= 1
+            },
+            pre_exchange: Some(&mut drain),
+        },
+    ))?;
+    match end {
+        LoopEnd::Deadline => println!("duration elapsed; leaving chat"),
+        LoopEnd::Interrupted => println!("interrupted; leaving chat"),
+        LoopEnd::Finished => println!("one exchange complete; leaving chat"),
+        LoopEnd::Closed(what) => return Err(runtime(format!("chat stopped: {what}"))),
+    }
+    Ok(())
 }
 
 /// Sign and store a public post; with `--sync`, run the node until any peer
@@ -445,16 +548,20 @@ pub(crate) fn publish(cli: &Cli, text: &str, sync: bool, timeout_seconds: u64) -
     let end = runtime_on(transport_session(
         &config,
         &mut node,
-        Some(Duration::from_secs(timeout_seconds)),
-        None,
-        Some(format!("sharing post {id} ({timeout_seconds}s)")),
-        &mut |_, exchanges| {
-            if exchanges >= 1 {
-                synced = true;
-                true
-            } else {
-                false
-            }
+        Session {
+            duration: Some(Duration::from_secs(timeout_seconds)),
+            expected_peer: None,
+            announce: Some(format!("sharing post {id} ({timeout_seconds}s)")),
+            redial: REDIAL_INTERVAL,
+            stop: &mut |_, exchanges| {
+                if exchanges >= 1 {
+                    synced = true;
+                    true
+                } else {
+                    false
+                }
+            },
+            pre_exchange: None,
         },
     ))?;
     if synced {

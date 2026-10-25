@@ -127,6 +127,19 @@ enum Commands {
         timeout: u64,
     },
 
+    /// Interactive direct messaging with one pinned peer. Each line is one
+    /// authenticated exchange; incoming messages print as they arrive.
+    Chat {
+        #[arg(long, value_name = "BID")]
+        to: String,
+        /// Leave after the first completed exchange.
+        #[arg(long)]
+        once: bool,
+        /// Leave after SECONDS; otherwise run until Ctrl-C.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        duration: Option<u64>,
+    },
+
     /// Sign and publish a public broadcast post, shared with peers at the
     /// next authenticated session. Unlike `note`, this leaves the device.
     Publish {
@@ -296,6 +309,11 @@ fn main() -> ExitCode {
             timeout,
         } => network::publish(&cli, text, sync, timeout),
         Commands::Feed { ref search, limit } => network::feed(&cli, search.as_deref(), limit),
+        Commands::Chat {
+            ref to,
+            once,
+            duration,
+        } => network::chat(&cli, to, once, duration),
         Commands::Inbox {
             ref search,
             limit,
