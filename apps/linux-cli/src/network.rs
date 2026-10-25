@@ -223,8 +223,12 @@ async fn run_exchange(
         report.peer.bid, report.peer.display_name
     );
     println!(
-        "  exchange: sent={} received={} destination_receipts={}",
-        report.sent, report.received, report.destination_receipts
+        "  exchange: sent={} received={} destination_receipts={} broadcast_sent={} broadcast_received={}",
+        report.sent,
+        report.received,
+        report.destination_receipts,
+        report.broadcast_sent,
+        report.broadcast_received
     );
     Ok(())
 }
