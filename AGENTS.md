@@ -660,3 +660,31 @@ Note: the laptop's MIDI characteristic `f36b109d-66f2-a9a1-1241-6838dbe57277`
 is a nonstandard UUID; the Pi's MIDI plugin probed it because it is a
 GATT-profile client for MIDI-class services, not because it enumerated our
 service list differently.
+
+### Chat on hardware and the queued-drain fix (2026-10-25)
+
+- The first chat attempt failed because `blendr-bluez-test`'s `chat`
+  subcommand never applied the MIDI-plugin drop-in (only `listen`/`once`
+  did). Every radio command (`listen`, `once`, `chat`, `send`, `scan`,
+  `publish --sync`) now isolates, and restores on exit only if *that*
+  invocation created the drop-in — a one-shot send leaves a manually
+  applied or concurrent-listener isolation alone.
+- A `pre_exchange`-drained stdin design was replaced by a tokio unbounded
+  `input` channel inside the session `select!`: lines reach `node.queue()`
+  immediately with a visible `you:` echo, then ride the next exchange —
+  previously they buffered invisibly until a link event.
+- Real-hardware verification (Pi `queue` + `listen`, laptop piped `chat`):
+  one exchange reported `sent=3 received=4 destination_receipts=3`,
+  emptying both outboxes. Pi inbox shows `direct <- laptop line` and the
+  backlog (`tvpi sees this`, `yo gurt`, `instant line`); laptop inbox
+  shows `direct <- pi reply line` and `laptop sees this` — the earlier
+  "transport operation failed" warning was a redundant duplicate exchange,
+  not the carrying one. Election noise (`link to peer already exists`,
+  `acquire write io … Write acquired`) appears as warnings during
+  dual-dial/accept convergence and is benign.
+- Post-run daemon state verified clean: no drop-ins, original ExecStart,
+  no blendr processes, `Powered=yes Discovering=no` on both controllers.
+- Residual: simultaneous `chat` on *both* hosts still occasionally drops
+  a concurrent dial mid-handshake (the same `le-connection-abort-by-local`
+  family). One-direction-initiate is deterministic; both-typing works but
+  the first connect may need a retry within the same run.
