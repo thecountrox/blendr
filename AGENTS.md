@@ -465,3 +465,33 @@ live peer, or `start` exchange against a second node — requires the second
 physical device. The known Pi-initiated `le-connection-abort-by-local`
 failures and daemon crashes documented above remain unresolved blockers for
 hardware acceptance.
+
+### First real-hardware secure exchange (2026-10-25)
+
+With the Phase 3 code deployed to `/home/pi/blendr` and Pi `config.local.json`
+frame cap raised 128 → 8192 (required >= 1024 for secure sessions), the laptop
+and Pi completed two authenticated Noise XX exchanges over hci0 ↔ hci0 under
+the documented temporary Pi MIDI-plugin isolation:
+
+- `peers --scan` on the laptop authenticated `tvpi`'s BID and pinned it
+  (`unverified`); `start` on the Pi likewise pinned `alice`. Mutual pin is
+  durable in each store.
+- `send --to <pi-bid>` delivered a real HPKE-encrypted message: laptop shows
+  `sent=1 … destination_receipts=1 … delivered`, Pi `inbox --direct` shows
+  `direct <- <laptop-bid>  hello pi, authenticated and encrypted` with the
+  ciphertext-only envelope at rest.
+- Without MIDI isolation the same trial failed mid-handshake: both sides
+  dialed, the Pi's BlueZ auto-connected the laptop's BLE-MIDI profile, SMP
+  failed (no agent), and the ACL was torn down (`br-connection-canceled` /
+  `le-connection-abort-by-local` + transport errors). This is the same
+  previously diagnosed daemon behavior, not a Phase 3 regression.
+- The Pi's redundant dial under concurrency correctly lost election
+  (`link to peer already exists`, `le-connection-abort-by-local` warnings);
+  the elected inbound link carried both exchanges.
+- Runtime override `90-blendr-phase3.conf` was removed afterward;
+  `bluetoothd` is `active` with its original ExecStart and no drop-ins.
+
+Remaining hardware notes: the asymmetric Pi-dial failure mode still appears
+as a *warning* on a losing concurrent dial; whether it also blocks
+Pi-initiated exchanges when the laptop is passive needs a dedicated
+orientation trial. Full Pi test suite (116 tests) passes on the Pi itself.
