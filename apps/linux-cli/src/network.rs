@@ -67,17 +67,23 @@ fn warn(message: impl std::fmt::Display) {
 }
 
 /// Tunables for one transport session. `expected_peer` restricts every
-/// exchange to one authenticated BID; `pre_exchange` runs once immediately
-/// before each exchange so commands like `chat` can inject fresh outbox
-/// items into the same session that carries them.
+/// exchange to one authenticated BID. `input`/`on_input` are an optional
+/// stdin-style feed: each line arriving on the channel is handed to
+/// `on_input` immediately inside the event loop, so chat text queues the
+/// moment it's typed rather than waiting for the next link event.
 struct Session<'a> {
     duration: Option<Duration>,
     expected_peer: Option<String>,
     announce: Option<String>,
     redial: Duration,
     stop: &'a mut dyn FnMut(&Node, u32) -> bool,
-    pre_exchange: Option<&'a mut dyn FnMut(&mut Node)>,
+    input: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    on_input: Option<&'a mut InputHook<'a>>,
 }
+
+/// Line handler signature for the stdin-style `input` feed. The object
+/// lifetime must be parameterized or it defaults to `'static`.
+type InputHook<'a> = dyn FnMut(&mut Node, String) + 'a;
 
 /// Create the transport, start advertising, then run the event loop; always
 /// tears the transport down afterward.
@@ -180,11 +186,20 @@ async fn event_loop(
                 Some(link) => Some(link),
                 None => return Ok(LoopEnd::Closed("accept channel closed")),
             },
+            line = async {
+                session.input.as_mut().unwrap().recv().await
+            }, if session.input.is_some() && session.on_input.is_some() => {
+                match line {
+                    Some(text) => {
+                        let hook = session.on_input.as_deref_mut().unwrap();
+                        hook(node, text);
+                    }
+                    None => session.input = None,
+                }
+                continue;
+            }
         };
         let Some(link) = link else { continue };
-        if let Some(hook) = session.pre_exchange.as_deref_mut() {
-            hook(node);
-        }
         match run_exchange(node, link, session.expected_peer.clone(), cancel).await {
             Ok(()) => {
                 exchanges += 1;
@@ -243,7 +258,8 @@ pub(crate) fn start(cli: &Cli, duration: Option<u64>, once: bool) -> Result<(), 
             announce: Some(announce),
             redial: REDIAL_INTERVAL,
             stop: &mut |_, exchanges| once && exchanges >= 1,
-            pre_exchange: None,
+            input: None,
+            on_input: None,
         },
     ))?;
     match end {
@@ -284,7 +300,8 @@ pub(crate) fn peers(
                 announce: Some(format!("scanning for peers ({duration}s)")),
                 redial: REDIAL_INTERVAL,
                 stop: &mut |_, _| false,
-                pre_exchange: None,
+                input: None,
+                on_input: None,
             },
         ))?;
         if let LoopEnd::Closed(what) = end {
@@ -409,7 +426,8 @@ pub(crate) fn send(
             announce: Some(format!("waiting for peer {to}")),
             redial: REDIAL_INTERVAL,
             stop: &mut |node, _| delivered(node),
-            pre_exchange: None,
+            input: None,
+            on_input: None,
         },
     ))?;
     if delivered(&node) {
@@ -450,7 +468,7 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
             ))
         })?;
     let name = peer.document.display_name.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         loop {
@@ -486,7 +504,6 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
             }
         }
     };
-    print_new(&node);
     let queue_line = |node: &mut Node, text: String| match blendr_messaging::now_ms() {
         Err(e) => warn(format!("cannot queue line: {e}")),
         Ok(now) => match node.queue(to, &text, now) {
@@ -494,16 +511,7 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
             Err(e) => warn(format!("cannot queue line: {e}")),
         },
     };
-    // First drain waits a moment so a piped/just-typed line lands in the
-    // channel before the outbox snap; later drains are nonblocking.
-    if let Ok(text) = rx.recv_timeout(Duration::from_millis(300)) {
-        queue_line(&mut node, text);
-    }
-    let mut drain = |node: &mut Node| {
-        while let Ok(text) = rx.try_recv() {
-            queue_line(node, text);
-        }
-    };
+    let mut on_input = queue_line;
     let end = runtime_on(transport_session(
         &config,
         &mut node,
@@ -516,7 +524,8 @@ pub(crate) fn chat(cli: &Cli, to: &str, once: bool, duration: Option<u64>) -> Re
                 print_new(node);
                 once && exchanges >= 1
             },
-            pre_exchange: Some(&mut drain),
+            input: Some(rx),
+            on_input: Some(&mut on_input),
         },
     ))?;
     match end {
@@ -561,7 +570,8 @@ pub(crate) fn publish(cli: &Cli, text: &str, sync: bool, timeout_seconds: u64) -
                     false
                 }
             },
-            pre_exchange: None,
+            input: None,
+            on_input: None,
         },
     ))?;
     if synced {

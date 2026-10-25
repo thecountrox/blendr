@@ -104,8 +104,10 @@ features for implemented behavior.
   the same session loop). One sequential event loop runs a single exchange
   at a time with a per-locator redial cooldown; the BlueZ adapter handles
   simultaneous-dial election. The loop's knobs sit in a `Session` struct;
-  `chat` uses a `pre_exchange` hook (stdin → `node.queue` right before each
-  exchange) plus a 2 s redial vs the 60 s default, and prints incoming
+  `chat` uses a tokio `input` channel + `on_input` hook (stdin →
+  `node.queue` inside the select loop the moment a line arrives, giving
+  immediate `you:` feedback) plus a 2 s redial vs the 60 s default, and
+  prints incoming
   messages deduplicated by ID seeded from history. Peer must be pinned.
   No `mesh` command exists.
 
