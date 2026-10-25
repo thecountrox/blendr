@@ -21,8 +21,8 @@ features for implemented behavior.
   bound to signed BIS documents, canonical-CBOR frames, HPKE addressed
   envelopes, distinct link/destination receipts, durable direct outbox,
   TOFU peer pinning/verify/block, and the `start`/`peers`/`send`/`inbox`
-  CLI. Verified over `MemoryTransport` end-to-end and CLI smoke on hci0;
-  cross-device secure messaging on real hardware is not yet run.
+  CLI. Verified over `MemoryTransport` end-to-end, CLI smoke on hci0, and
+  a Pi↔laptop authenticated exchange under MIDI isolation (see below).
 - Phase 4 (one-neighbor broadcast sync): implemented and verified locally —
   `features.broadcast_mode` config flag, new negotiated capability fields
   (`broadcast_enabled`, `inventory_max_ids`), signed `BroadcastEnvelope`
@@ -31,7 +31,9 @@ features for implemented behavior.
   inventory suppresses re-offers for restart-resume), `Node::publish`/`feed`
   plus `blendr publish`/`blendr feed`. Verified by an in-memory
   bidirectional test (delivery, dedup, second-session idempotency, self-
-  origin/conflict rejection) and CLI smoke. Not yet on real hardware.
+  origin/conflict rejection), CLI smoke, and a real Pi↔laptop exchange
+  under the documented MIDI isolation (bidirectional posts, ledger
+  idempotency, direct send with receipt — see the dated section below).
   Mesh forwarding of posts (`mesh`) remains unimplemented: broadcasts move
   one hop only, even though envelopes carry a signed `max_jumps` ceiling.
 - Phases 5–8: not implemented. Mesh forwarding, Android interoperability,
