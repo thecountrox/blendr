@@ -688,3 +688,22 @@ service list differently.
   a concurrent dial mid-handshake (the same `le-connection-abort-by-local`
   family). One-direction-initiate is deterministic; both-typing works but
   the first connect may need a retry within the same run.
+
+### Chat incoming-print fix verified on hardware (2026-10-25)
+
+- Root cause of "messages don't appear": `print_new` ran only inside the
+  `stop` hook, which fires solely on `run_exchange` success. Sessions that
+  delivered messages then died at goodbye/teardown left stored rows
+  unprinted — `inbox` had them all along. A new `after_exchange` hook now
+  runs after every attempt (success or failure) and `history` read errors
+  warn instead of being silently swallowed.
+- Live verification (symmetric `chat` on both hosts): one exchange
+  `sent=2 received=2 destination_receipts=2` on each side; the laptop
+  printed `tvpi: visible incoming test` and `tvpi: pi to laptop live`,
+  the Pi printed `alice: verify incoming print` and `alice: laptop to pi
+  live`. Prior-run queued lines delivered too. Dual-dial warnings
+  (`link to peer already exists`) appeared and resolved via election.
+- Confirmed again: `listen <BID>` treats the argument as publish text —
+  for two-way typing run `chat` on BOTH hosts; `listen` is receive-only.
+- Daemon state clean afterward (no drop-ins, original ExecStart,
+  `Powered=yes Discovering=no`, no blendr processes).
