@@ -20,6 +20,8 @@ pub(crate) fn options() -> SessionOptions {
             max_bytes: 65536,
             link_receipt: true,
             destination_receipt: true,
+            broadcast_enabled: true,
+            inventory_max_ids: 64,
         },
         blocked_bids: Vec::new(),
         expected_peer: None,

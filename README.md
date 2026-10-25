@@ -10,10 +10,11 @@ local notes, authenticated Noise XX sessions, and addressed direct messages
 over Bluetooth LE, plus shared framing, an in-memory radio, and a BlueZ BLE
 adapter.
 
-Not implemented yet: broadcast sync (`publish`), mesh forwarding, or Android.
-Private notes are still local-only and are never transmitted. The BLE examples
-exchange only unauthenticated diagnostic frames; do not use them for private
-messages.
+Not implemented yet: mesh forwarding (`blendr mesh`), or Android. Private
+notes are still local-only and are never transmitted; `publish` is the only
+content that leaves the device, and only after explicit opt-in. The BLE
+examples exchange only unauthenticated diagnostic frames; do not use them
+for private messages.
 
 ## Usage
 
@@ -42,6 +43,11 @@ blendr peers verify BID --fingerprint HEX64   # out-of-band key check
 blendr peers block BID / unblock BID
 blendr send --to BID "hello"       # encrypt, queue, deliver within --timeout
 blendr send --to BID "hello" --queue-only     # queue only; `start` delivers
+
+blendr publish "hello nearby"     # sign + store a public post
+blendr publish "hi" --sync 60     # also share it within the deadline
+blendr feed                       # public posts, newest first
+blendr feed --search "nearby"
 ```
 
 Passphrases are only ever read from the terminal (with confirmation when
@@ -104,6 +110,31 @@ run `blendr identity rename "<desired name>"` to reconcile.
 - `inbox` merges private notes (marked `note`) and direct history (`direct
   ->`/`direct <-` with the peer BID and state) into one newest-first page;
   `--peer` and `--direct` filter it.
+
+### Broadcast semantics
+
+- `blendr publish` signs the post with your identity and stores it in the
+  public feed — no delivery attempt is made until `--sync` or the next
+  `start`/`peers --scan` session. Posts are public by design: signed but
+  **not** encrypted, and may be reshared by peers within the signed
+  `mesh.outgoing.max_jumps` ceiling.
+- During an authenticated session (when both nodes advertise
+  `features.broadcast_mode`), each side advertises a bounded inventory of
+  unexpired, unacknowledged post IDs, the peer requests only the ones it is
+  missing, and transfers run inside the same negotiated per-session
+  count/byte budget as direct messages. A peer may never request IDs that
+  were not offered.
+- The receiving side verifies the origin signature, expiry, and text bound
+  before durable storage; a successful store is acknowledged back so the
+  sender's per-peer ledger suppresses re-offers on later sessions — this is
+  the restart-resume behavior, and it also keeps a lost connection from
+  re-sending already-delivered posts.
+- `blendr feed` lists authored and received posts newest-first; `feed
+  --search` filters on post text or the origin's claimed display name
+  (informational — the signature, not the name, is the proof).
+- Private `note`s and direct history are **never** included in inventories
+  or offered to any peer, regardless of configuration.
+
 
 ### `identity export` / `import` semantics
 
@@ -339,20 +370,22 @@ operation with the original daemon configuration.
 
 ## Limitations
 
-- `publish` (broadcast sync) and `mesh` commands do not exist; direct
-  messages are delivered only while the two nodes are in direct BLE range.
-  `note` data never leaves the device.
+- `mesh` (relay forwarding) does not exist; posts and direct messages reach
+  only nodes in direct BLE range, even though post envelopes carry a signed
+  `max_jumps` ceiling for future forwarding. `note` data never leaves the
+  device.
 - The SQLite database is not fully encrypted; private notes and own outbound
   text are protected only by filesystem permissions (`0600`/`0700`).
-  Received messages are ciphertext-only at rest. Private keys are always
+  Received messages are ciphertext-only at rest; broadcast posts are
+  intentionally stored with their public plaintext. Private keys are always
   encrypted at rest.
 - Config changes require editing `config.json`; display-name changes must go
   through `blendr identity rename` or commands refuse with a drift error.
   Secure sessions require `transport.ble.max_frame_payload_bytes >= 1024`.
-- Cross-device secure messaging has not yet been run on real hardware; the
-  adapter-level diagnostics above apply, including known BlueZ/controller
-  failures. `blendr send` delivery semantics are verified in-memory and by
-  test, not yet Pi↔laptop.
+- Direct messaging has run Pi↔laptop once under the documented MIDI-plugin
+  isolation (AGENTS.md); broadcast sync is verified by in-memory tests
+  only so far, and the known BlueZ/controller failure modes above still
+  apply to the real adapter.
 - Identity import never replaces an existing identity; deleting a keystore
   or database to start over is an explicit, manual operation.
 - If none of `busctl`/`dbus-send`/`bluetoothctl` exist, doctor's daemon and

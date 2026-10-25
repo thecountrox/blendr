@@ -127,6 +127,27 @@ enum Commands {
         timeout: u64,
     },
 
+    /// Sign and publish a public broadcast post, shared with peers at the
+    /// next authenticated session. Unlike `note`, this leaves the device.
+    Publish {
+        /// Post text (bounded by messaging.max_text_utf8_bytes).
+        text: String,
+        /// Also run the node until the post reaches one peer or times out.
+        #[arg(long)]
+        sync: bool,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: u64,
+    },
+
+    /// List public broadcast posts (authored and received), newest first.
+    Feed {
+        /// Literal substring search (ASCII case-insensitive).
+        #[arg(long, value_name = "QUERY")]
+        search: Option<String>,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit: u32,
+    },
+
     /// Store a private local note. Notes are never published, synced, or
     /// relayed; they stay inside the local database.
     Note {
@@ -269,6 +290,12 @@ fn main() -> ExitCode {
             queue_only,
             timeout,
         } => network::send(&cli, to, text, queue_only, timeout),
+        Commands::Publish {
+            ref text,
+            sync,
+            timeout,
+        } => network::publish(&cli, text, sync, timeout),
+        Commands::Feed { ref search, limit } => network::feed(&cli, search.as_deref(), limit),
         Commands::Inbox {
             ref search,
             limit,

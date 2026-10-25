@@ -23,9 +23,20 @@ features for implemented behavior.
   TOFU peer pinning/verify/block, and the `start`/`peers`/`send`/`inbox`
   CLI. Verified over `MemoryTransport` end-to-end and CLI smoke on hci0;
   cross-device secure messaging on real hardware is not yet run.
-- Phases 4–8: not implemented. Broadcast sync, mesh forwarding, Android
-  interoperability, and protocol freeze are pending. No Kotlin/Compose app,
-  Android BLE adapter, JNI bridge, or Android Keystore integration exists.
+- Phase 4 (one-neighbor broadcast sync): implemented and verified locally —
+  `features.broadcast_mode` config flag, new negotiated capability fields
+  (`broadcast_enabled`, `inventory_max_ids`), signed `BroadcastEnvelope`
+  wire type, `Inventory`/`SyncRequest`/`SyncEnd`/`BroadcastAck` session
+  frames, durable `Store` broadcast ledger (offered→acknowledged per peer,
+  inventory suppresses re-offers for restart-resume), `Node::publish`/`feed`
+  plus `blendr publish`/`blendr feed`. Verified by an in-memory
+  bidirectional test (delivery, dedup, second-session idempotency, self-
+  origin/conflict rejection) and CLI smoke. Not yet on real hardware.
+  Mesh forwarding of posts (`mesh`) remains unimplemented: broadcasts move
+  one hop only, even though envelopes carry a signed `max_jumps` ceiling.
+- Phases 5–8: not implemented. Mesh forwarding, Android interoperability,
+  and protocol freeze are pending. No Kotlin/Compose app, Android BLE
+  adapter, JNI bridge, or Android Keystore integration exists.
 
 ## Implemented components
 
@@ -41,8 +52,13 @@ features for implemented behavior.
   private notes, deduplication, and literal substring search. `direct.rs` adds
   TOFU-pinned peers with monotonic document updates, social trust
   (unverified/verified/blocked), a durable direct outbox, ciphertext-only
-  inbound history, and distinct link/destination receipt state. Relay
-  forwarding APIs are still not implemented.
+  inbound history, and distinct link/destination receipt state; plus the
+  Phase 4 broadcast store: public posts keep their signed envelope AND
+  plaintext, `broadcast_inventory`/`broadcast_offer`/`accept_broadcast`/
+  `mark_broadcast_offered`/`mark_broadcast_acknowledged`/`broadcast_feed`/
+  `has_broadcast`, and the shared `peer_delivery_ledger` suppresses
+  re-offers across sessions. Relay forwarding APIs are still not
+  implemented.
 - `crates/blendr-protocol`: Noise XX (`Noise_XX_25519_ChaChaPoly_SHA256`) over
   `PeerLink` with per-endpoint 32-byte nonces; signed BIS document + proof
   binding BID, role, handshake transcript, nonces, and the Noise static key
@@ -51,6 +67,11 @@ features for implemented behavior.
   Canonical-CBOR codec rejects nonminimal/indefinite/extra input before
   allocating. HPKE (X25519/SHA-256/ChaCha20-Poly1305) protects persisted
   addressed envelopes; receipts are Ed25519-signed per message/kind.
+  Phase 4 adds `BroadcastEnvelope` (signed public post; the signature is the
+  only auth, plaintext and origin identity document travel in-band) and the
+  `Inventory`/`SyncRequest`/`SyncEnd`/`BroadcastAck`/`BroadcastMessage`
+  sync frames; negotiated capabilities gained `broadcast_enabled` and
+  `inventory_max_ids`.
   snow's `use-getrandom` feature is REQUIRED — without it `local_private_key`
   fails with `Init(GetRngImpl)` at runtime and every handshake errors.
 - `crates/blendr-messaging`: `Node` orchestrates queue → authenticate →
@@ -58,7 +79,12 @@ features for implemented behavior.
   selection respects negotiated per-session count/byte budgets; incoming
   plaintext is validated then discarded (ciphertext-only at rest); receipts
   issue only after durable dedup commit. `history` decrypts on read without
-  enforcing TTL so expiry never erases personal history.
+  enforcing TTL so expiry never erases personal history. When both sides
+  negotiate `broadcast_enabled`, a symmetric inventory→request→transfer→ack
+  sync runs after the direct turns (initiator offers first, then fetches);
+  posts are verified (origin signature, expiry, text bound, self-origin
+  rejection) before durable commit, and ledger acks bound the session the
+  same way as direct transfers. `publish`/`feed` expose the durable feed.
 - `crates/blendr-transport`: bounded versioned fragmentation/reassembly,
   cancellation, timeout recovery, and an in-memory radio with loss, delay,
   disconnection, range changes, bounded queues, and connection election.
@@ -69,11 +95,12 @@ features for implemented behavior.
   is not established.
 - `apps/linux-cli`: `doctor`, `init`, `identity show|rename|export|import`,
   `note`, `start --duration/--once`, `peers [--scan] [verify|block|unblock]`,
-  `send --to BID [--queue-only]`, and a merged `inbox` (notes + direct
-  history, `--peer`/`--direct`/`--search`). One sequential event loop runs a
-  single exchange at a time with a 60 s per-locator redial cooldown; the
-  BlueZ adapter handles simultaneous-dial election. No `publish` or `mesh`
-  command exists.
+  `send --to BID [--queue-only]`, a merged `inbox`
+  (notes + direct history, `--peer`/`--direct`/`--search`), `publish`
+  (`--sync` shares within a deadline), and `feed` (`--search`). One
+  sequential event loop runs a single exchange at a time with a 60 s
+  per-locator redial cooldown; the BlueZ adapter handles simultaneous-dial
+  election. No `mesh` command exists.
 
 ## Verification evidence
 
@@ -495,3 +522,63 @@ Remaining hardware notes: the asymmetric Pi-dial failure mode still appears
 as a *warning* on a losing concurrent dial; whether it also blocks
 Pi-initiated exchanges when the laptop is passive needs a dedicated
 orientation trial. Full Pi test suite (116 tests) passes on the Pi itself.
+
+## Phase 4 one-neighbor broadcast sync (2026-10-25)
+
+`blendr publish`/`blendr feed`, a `features.broadcast_mode` config flag, new
+negotiated capabilities (`broadcast_enabled`, `inventory_max_ids`), a signed
+`BroadcastEnvelope` wire type, four sync frames, a durable broadcast store
+sharing `peer_delivery_ledger`, and a symmetric inventory→request→transfer→
+ack turn pair inside `Node::exchange` implement the direct-neighbor part of
+Phase 4. Mesh forwarding (`mesh`, multi-hop) remains unimplemented: posts
+move one hop only, even though the envelope carries a signed `max_jumps`
+ceiling for later use.
+
+Design decisions taken:
+
+- Broadcasts are public and opt-in: signed but never encrypted, plaintext
+  retained at rest, and `publish` refuses when `features.broadcast_mode` is
+  off. The origin's full signed identity document travels in-band, so any
+  holder (including non-pinned contacts in a future mesh) can verify.
+- The per-peer ledger (`offered`→`acknowledged`) is written *before* the
+  Inventory frame is sent, so a session that dies mid-sync resumes without
+  re-offering acknowledged or already-offered posts. The fetch side
+  acknowledges only posts it durably committed; ack rows are forced
+  (immutable) storage writes — a peer cannot un-acknowledge by lying.
+- Requests and acks are strictly bound to what was offered/sent: requesting
+  an un-offered ID, or acknowledging an un-sent ID, fails the session.
+  Synced frames consume the same negotiated per-session count/byte budget as
+  direct messages; the offer side truncates at budget exhaustion rather than
+  erroring, and the fetch side finishes on `SyncEnd`.
+- Private notes and direct history are never included in any inventory.
+- `Node::publish` sends a signed `BroadcastEnvelope` on the wire; the stored
+  row keeps the envelope for verification/future forwarding plus public
+  plaintext for the feed. `Store::accept_broadcast` rejects self-origins,
+  same-ID different-content conflicts, and (via `require_peer` bound at the
+  messaging layer) blocked origins; dedup is ID-based.
+
+Verification (this session, local):
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked
+  -- -D warnings`, `cargo test --workspace --all-targets --locked` (119
+  tests, all pass), and `cargo build --workspace --all-targets`.
+- New `broadcast_sync_is_bidirectional_durable_and_idempotent` (5-test
+  suite) proves over `MemoryTransport`: one exchange delivers a post each
+  direction (`broadcast_sent`/`broadcast_received`=1), both feeds show both
+  posts with retained signed envelopes, a second exchange is a no-op
+  (all four counters 0 — ledger suppresses re-offers), self-origin inbound
+  and same-ID different-content are rejected.
+- `publish_respects_feature_flag_and_bounds` proves the disabled flag,
+  empty text, and oversized text all fail before storage.
+- CLI smoke: `publish` stores and prints a UUID, `feed` lists the post with
+  `you` direction, `feed --search` filters, empty `publish` exits 1.
+- `inventory_max_ids`/`broadcast_enabled` added to `Capabilities` and the
+  `Settings` capability merger; the `send_turn` signature was restored after
+  an earlier edit truncated it.
+
+Not verified: any real-hardware broadcast exchange (Pi still carries the
+Phase 3 build; a deploy + cross-device trial is outstanding), and behavior
+with an empty `Inventory` on BlueZ or with concurrent direct+sync traffic on
+a shared radio. `SyncRequest`/`BroadcastAck` use `UUIDv4` text IDs in CBOR
+arrays; this stays under the negotiated frame bounds because
+`inventory_max_ids` caps them.

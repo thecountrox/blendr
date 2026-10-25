@@ -560,7 +560,7 @@ fn decode_peer((bytes, trust, first_seen_ms, last_seen_ms): RawPeer) -> Result<P
     })
 }
 
-fn owner_bid(conn: &Connection) -> Result<String> {
+pub(super) fn owner_bid(conn: &Connection) -> Result<String> {
     conn.query_row("SELECT bid FROM identities WHERE is_local = 1", [], |r| {
         r.get(0)
     })
@@ -568,7 +568,7 @@ fn owner_bid(conn: &Connection) -> Result<String> {
     .ok_or_else(|| invalid_input("local identity is not installed"))
 }
 
-fn require_peer(conn: &Connection, bid: &str) -> Result<()> {
+pub(super) fn require_peer(conn: &Connection, bid: &str) -> Result<()> {
     let trust: Option<String> = conn
         .query_row(
             "SELECT p.trust_status FROM peers p JOIN identities i ON i.bid = p.bid
@@ -584,14 +584,14 @@ fn require_peer(conn: &Connection, bid: &str) -> Result<()> {
     }
 }
 
-fn positive_time(time: i64) -> Result<()> {
+pub(super) fn positive_time(time: i64) -> Result<()> {
     if time <= 0 {
         return Err(invalid_input("timestamp must be positive"));
     }
     Ok(())
 }
 
-fn page_limit(limit: u32) -> Result<()> {
+pub(super) fn page_limit(limit: u32) -> Result<()> {
     if limit == 0 || limit > super::MAX_LOCAL_MESSAGE_LIMIT {
         return Err(invalid_input("direct message limit must be in 1..=10000"));
     }
@@ -708,7 +708,13 @@ fn require_outgoing(conn: &Connection, peer: &str, message_id: &str) -> Result<(
     Ok(())
 }
 
-fn update_ledger(conn: &Connection, peer: &str, id: &str, state: &str, now_ms: i64) -> Result<()> {
+pub(super) fn update_ledger(
+    conn: &Connection,
+    peer: &str,
+    id: &str,
+    state: &str,
+    now_ms: i64,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO peer_delivery_ledger (peer_bid, message_id, state, updated_at_ms)
          VALUES (?1, ?2, ?3, ?4)

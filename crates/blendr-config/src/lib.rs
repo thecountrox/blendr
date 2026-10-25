@@ -250,9 +250,9 @@ pub struct ObservabilityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeaturesConfig {
-    broadcast_mode: bool,
+    pub broadcast_mode: bool,
     pub direct_messages: bool,
-    match_mode_v2: bool,
+    pub match_mode_v2: bool,
     pub wifi_transport: bool,
     pub internet_relay: bool,
 }

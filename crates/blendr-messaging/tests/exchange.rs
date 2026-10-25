@@ -20,6 +20,8 @@ fn settings() -> Settings {
             max_bytes: 16_384,
             link_receipt: true,
             destination_receipt: true,
+            broadcast_enabled: true,
+            inventory_max_ids: 64,
         },
         blocked_bids: Vec::new(),
         ttl_ms: 3_600_000,
@@ -49,6 +51,126 @@ fn memory_pair() -> (
         net.node("alice", cfg).unwrap(),
         net.node("bob", cfg).unwrap(),
     )
+}
+
+/// Signed public posts sync both directions in one exchange, land in the
+/// durable feed, and ledger state suppresses re-offer on the next session.
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_sync_is_bidirectional_durable_and_idempotent() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let mut alice = node(&dir_a, "alice");
+    let mut bob = node(&dir_b, "bob");
+    let (ta, tb) = memory_pair();
+    let mut events = ta.watch_peers().await.unwrap();
+    let mut accepted = tb.accept_links().await.unwrap();
+    tb.start_advertising(uuid::Uuid::from_u128(1))
+        .await
+        .unwrap();
+    let locator = match events.recv().await.unwrap() {
+        PeerEvent::Discovered(l) => l,
+        _ => panic!("expected discovery"),
+    };
+    let cancel = CancellationToken::new();
+    let alice_bid = alice.bid().to_string();
+    let bob_bid = bob.bid().to_string();
+
+    let now = now_ms().unwrap();
+    let a_post = alice.publish("alice broadcast", now).unwrap();
+    let b_post = bob.publish("bob broadcast", now).unwrap();
+
+    let link_a = ta.connect(locator.clone(), &cancel).await.unwrap();
+    let link_b = accepted.recv().await.unwrap();
+    let (ra, rb) = tokio::join!(
+        alice.exchange(link_a, Some(bob_bid.clone()), &cancel),
+        bob.exchange(link_b, Some(alice_bid.clone()), &cancel),
+    );
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(ra.broadcast_sent, 1);
+    assert_eq!(ra.broadcast_received, 1);
+    assert_eq!(rb.broadcast_sent, 1);
+    assert_eq!(rb.broadcast_received, 1);
+
+    // Both feeds carry both posts; text is retained (posts are public).
+    let feed_a = alice.feed(10, 0).unwrap();
+    let feed_b = bob.feed(10, 0).unwrap();
+    assert_eq!(feed_a.len(), 2);
+    assert_eq!(feed_b.len(), 2);
+    assert!(
+        feed_a
+            .iter()
+            .any(|p| p.id == b_post && p.text == "bob broadcast" && !p.outgoing)
+    );
+    assert!(
+        feed_b
+            .iter()
+            .any(|p| p.id == a_post && p.text == "alice broadcast" && !p.outgoing)
+    );
+    // Received copies keep the full signed envelope for verification/forwarding.
+    let received = feed_a.iter().find(|p| p.id == b_post).unwrap();
+    blendr_protocol::BroadcastEnvelope::decode(&received.envelope, 8192, 4096).unwrap();
+
+    // Second exchange: acknowledged posts are neither re-offered nor resent.
+    let link_a = ta.connect(locator, &cancel).await.unwrap();
+    let link_b = accepted.recv().await.unwrap();
+    let (ra, rb) = tokio::join!(
+        alice.exchange(link_a, Some(bob_bid.clone()), &cancel),
+        bob.exchange(link_b, Some(alice_bid.clone()), &cancel),
+    );
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(ra.broadcast_sent, 0);
+    assert_eq!(ra.broadcast_received, 0);
+    assert_eq!(rb.broadcast_sent, 0);
+    assert_eq!(rb.broadcast_received, 0);
+    assert_eq!(alice.feed(10, 0).unwrap().len(), 2);
+
+    // Storage rejects misuse: self-origin inbound and same-ID different content.
+    let mut hostile = blendr_storage::BroadcastMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        origin_bid: alice_bid.clone(),
+        envelope: vec![1],
+        text: "spoofed".into(),
+        origin_name: "alice".into(),
+        created_at_ms: now,
+        expires_at_ms: now + 60_000,
+        outgoing: false,
+    };
+    assert!(
+        alice
+            .store_mut()
+            .accept_broadcast(&hostile, &bob_bid, now)
+            .is_err()
+    );
+    hostile.origin_bid = bob_bid.clone();
+    hostile.id = a_post.clone();
+    assert!(
+        alice
+            .store_mut()
+            .accept_broadcast(&hostile, &bob_bid, now)
+            .is_err()
+    );
+}
+
+/// Publish policy: broadcast-disabled configs and oversize text fail before
+/// anything is stored.
+#[test]
+fn publish_respects_feature_flag_and_bounds() {
+    let dir = TempDir::new().unwrap();
+    let mut node = node(&dir, "solo");
+    // Disabled flag refuses before any storage; the same holds for empty
+    // text and text over the negotiated ceiling once enabled.
+    let mut off = settings();
+    off.capabilities.broadcast_enabled = false;
+    let identity = Identity::generate("off").unwrap();
+    let mut store = Store::open(dir.path().join("off.db"), false).unwrap();
+    let document = serde_json::to_vec(&identity.document()).unwrap();
+    store.set_local_identity(identity.bid(), &document).unwrap();
+    let mut disabled = Node::new(identity, store, off).unwrap();
+    assert!(disabled.publish("post", now_ms().unwrap()).is_err());
+    assert!(node.publish("", now_ms().unwrap()).is_err());
+    let huge = "x".repeat(4097);
+    assert!(node.publish(&huge, now_ms().unwrap()).is_err());
+    assert!(node.feed(10, 0).unwrap().is_empty());
 }
 
 /// Authenticate once so each peer is pinned, then queue outbound messages and

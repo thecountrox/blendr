@@ -58,6 +58,9 @@ impl Settings {
                     .messaging
                     .acknowledgements
                     .destination_delivery_receipt,
+                broadcast_enabled: config.features.broadcast_mode
+                    && config.messaging.sharing.broadcast_requires_explicit_opt_in,
+                inventory_max_ids: config.messaging.sharing.inventory_max_message_ids as u32,
             },
             blocked_bids: config.security.blocked_bids.clone(),
             ttl_ms: (config.messaging.default_message_ttl_seconds * 1000) as i64,
@@ -93,6 +96,8 @@ pub struct ExchangeReport {
     pub sent: u32,
     pub received: u32,
     pub destination_receipts: u32,
+    pub broadcast_sent: u32,
+    pub broadcast_received: u32,
 }
 
 /// User-visible history projection, deliberately not Debug (contains text).
@@ -292,12 +297,27 @@ impl Node {
             sent: 0,
             received: 0,
             destination_receipts: 0,
+            broadcast_sent: 0,
+            broadcast_received: 0,
         };
+        let broadcast =
+            self.settings.capabilities.broadcast_enabled && peer_limits.broadcast_enabled;
+        let inventory_ids = self
+            .settings
+            .capabilities
+            .inventory_max_ids
+            .min(peer_limits.inventory_max_ids);
         if session.role() == LinkRole::Initiator {
             self.send_turn(session, &mut budget, &mut report, cancel)
                 .await?;
             self.receive_turn(session, &mut budget, &mut report, cancel)
                 .await?;
+            if broadcast {
+                self.broadcast_offer_turn(session, &mut budget, inventory_ids, &mut report, cancel)
+                    .await?;
+                self.broadcast_fetch_turn(session, &mut budget, inventory_ids, &mut report, cancel)
+                    .await?;
+            }
             session.send(&Frame::Goodbye, cancel).await?;
             expect_goodbye(session, cancel).await?;
             session.send(&Frame::Goodbye, cancel).await?;
@@ -307,6 +327,12 @@ impl Node {
                 .await?;
             self.send_turn(session, &mut budget, &mut report, cancel)
                 .await?;
+            if broadcast {
+                self.broadcast_fetch_turn(session, &mut budget, inventory_ids, &mut report, cancel)
+                    .await?;
+                self.broadcast_offer_turn(session, &mut budget, inventory_ids, &mut report, cancel)
+                    .await?;
+            }
             expect_goodbye(session, cancel).await?;
             session.send(&Frame::Goodbye, cancel).await?;
             expect_goodbye(session, cancel).await?;
@@ -315,7 +341,6 @@ impl Node {
         }
         Ok(report)
     }
-
     async fn send_turn(
         &mut self,
         session: &mut SecureSession,
@@ -478,6 +503,237 @@ impl Node {
                     .await?;
             }
         }
+    }
+
+    /// Offer-side broadcast sync: advertise unexpired, unacknowledged post IDs
+    /// (ledger-backed, so a reconnect does not re-offer acknowledged posts),
+    /// serve the requested subset inside the negotiated budget, then apply
+    /// the peer's durable-store acknowledgements.
+    async fn broadcast_offer_turn(
+        &mut self,
+        session: &mut SecureSession,
+        budget: &mut Budget,
+        inventory_ids: u32,
+        report: &mut ExchangeReport,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let peer = session.peer().clone();
+        let now = now_ms()?;
+        let inventory = self
+            .store
+            .broadcast_inventory(&peer.bid, now, inventory_ids)?;
+        let advertised: std::collections::HashSet<String> = inventory.iter().cloned().collect();
+        // Persist the offer before sending: a session that dies mid-sync
+        // resumes with these IDs already ledger-offered for this peer.
+        self.store
+            .mark_broadcast_offered(&peer.bid, &inventory, now)?;
+        session.send(&Frame::Inventory(inventory), cancel).await?;
+        let want = match session.recv(cancel).await? {
+            Frame::SyncRequest(ids) => ids,
+            _ => {
+                return Err(MessagingError::Policy(
+                    "expected a broadcast request after inventory",
+                ));
+            }
+        };
+        if want.iter().any(|id| !advertised.contains(id)) {
+            return Err(MessagingError::Policy(
+                "peer requested broadcasts that were never offered",
+            ));
+        }
+        let mut sent = Vec::new();
+        for id in &want {
+            let Some(post) = self.store.broadcast_offer(id, now)? else {
+                continue;
+            };
+            if post.envelope.len() > session.max_message_bytes() {
+                return Err(MessagingError::Policy(
+                    "stored broadcast exceeds the negotiated frame limit",
+                ));
+            }
+            if budget.messages == 0 || post.envelope.len() > budget.bytes {
+                // Gracefully truncate: remaining requests stay pending for a
+                // later session rather than poisoning this one.
+                break;
+            }
+            budget.consume(post.envelope.len())?;
+            session
+                .send(&Frame::BroadcastMessage(post.envelope), cancel)
+                .await?;
+            sent.push(post.id);
+            report.broadcast_sent += 1;
+        }
+        session.send(&Frame::SyncEnd, cancel).await?;
+        let acked = match session.recv(cancel).await? {
+            Frame::BroadcastAck(ids) => ids,
+            _ => {
+                return Err(MessagingError::Policy(
+                    "expected broadcast acknowledgements after sync end",
+                ));
+            }
+        };
+        let sent_set: std::collections::HashSet<&String> = sent.iter().collect();
+        if acked.iter().any(|id| !sent_set.contains(id)) {
+            return Err(MessagingError::Policy(
+                "peer acknowledged broadcasts it never received",
+            ));
+        }
+        self.store
+            .mark_broadcast_acknowledged(&peer.bid, &acked, now)?;
+        Ok(())
+    }
+
+    /// Fetch-side broadcast sync: read the peer's inventory, request missing
+    /// non-self-authored IDs, verify/persist each envelope as it arrives, and
+    /// acknowledge only posts that reached durable storage.
+    async fn broadcast_fetch_turn(
+        &mut self,
+        session: &mut SecureSession,
+        budget: &mut Budget,
+        inventory_ids: u32,
+        report: &mut ExchangeReport,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let peer_bid = session.peer().bid.clone();
+        let offered = match session.recv(cancel).await? {
+            Frame::Inventory(ids) => ids,
+            _ => {
+                return Err(MessagingError::Policy(
+                    "expected a broadcast inventory to start sync",
+                ));
+            }
+        };
+        if offered.len() > inventory_ids as usize {
+            return Err(MessagingError::Policy(
+                "peer exceeded the negotiated broadcast inventory bound",
+            ));
+        }
+        let mut want = Vec::new();
+        for id in offered {
+            if want.len() >= budget.messages.min(inventory_ids) as usize {
+                break;
+            }
+            if !self.store.has_broadcast(&id)? {
+                want.push(id);
+            }
+        }
+        session.send(&Frame::SyncRequest(want), cancel).await?;
+        let text_max = self
+            .settings
+            .capabilities
+            .max_text_bytes
+            .min(session.peer_capabilities().max_text_bytes) as usize;
+        let mut accepted = Vec::new();
+        loop {
+            let bytes = match session.recv(cancel).await? {
+                Frame::SyncEnd => break,
+                Frame::BroadcastMessage(bytes) => bytes,
+                _ => {
+                    return Err(MessagingError::Policy(
+                        "unexpected frame during broadcast sync",
+                    ));
+                }
+            };
+            budget.consume(bytes.len())?;
+            let now = now_ms()?;
+            let envelope = blendr_protocol::BroadcastEnvelope::decode(
+                &bytes,
+                session.max_message_bytes(),
+                text_max,
+            )?;
+            if envelope.expires_at_ms <= now || envelope.created_at_ms > now.saturating_add(300_000)
+            {
+                return Err(MessagingError::Policy(
+                    "broadcast expired or sender clock is more than five minutes ahead",
+                ));
+            }
+            self.check_peer(&envelope.origin.bid)?;
+            let fresh = self.store.accept_broadcast(
+                &blendr_storage::BroadcastMessage {
+                    id: envelope.message_id.clone(),
+                    origin_bid: envelope.origin.bid.clone(),
+                    envelope: bytes,
+                    text: envelope.text.clone(),
+                    origin_name: envelope.origin.display_name.clone(),
+                    created_at_ms: envelope.created_at_ms,
+                    expires_at_ms: envelope.expires_at_ms,
+                    outgoing: false,
+                },
+                &peer_bid,
+                now,
+            )?;
+            if fresh {
+                report.broadcast_received += 1;
+            }
+            accepted.push(envelope.message_id.clone());
+        }
+        session.send(&Frame::BroadcastAck(accepted), cancel).await?;
+        Ok(())
+    }
+
+    /// Explicitly publish a public post: signed, stored to the local feed and
+    /// offered to peers at the next authenticated session. Returns the ID.
+    pub fn publish(&mut self, text: &str, now_ms: i64) -> Result<String> {
+        if !self.settings.capabilities.broadcast_enabled {
+            return Err(MessagingError::Policy(
+                "broadcast publishing is disabled in configuration",
+            ));
+        }
+        self.settings.validate_network()?;
+        if text.is_empty() || text.len() > self.settings.capabilities.max_text_bytes as usize {
+            return Err(MessagingError::Policy(
+                "post is empty or exceeds messaging.max_text_utf8_bytes",
+            ));
+        }
+        let expires_at_ms =
+            now_ms
+                .checked_add(self.settings.ttl_ms)
+                .ok_or(MessagingError::Policy(
+                    "post expiration overflows the clock range",
+                ))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = blendr_protocol::seal_broadcast(
+            &self.identity,
+            text,
+            EnvelopeMetadata {
+                message_id: id.clone(),
+                created_at_ms: now_ms,
+                expires_at_ms,
+                max_jumps: self.settings.max_jumps,
+            },
+        )?;
+        let bytes = envelope.encode();
+        if bytes.len()
+            > blendr_protocol::max_message_bytes(
+                self.settings.capabilities.max_frame_bytes as usize,
+            )
+        {
+            return Err(MessagingError::Policy(
+                "post exceeds the configured frame limit; increase transport.ble.max_frame_payload_bytes",
+            ));
+        }
+        self.store.publish_broadcast(
+            &blendr_storage::BroadcastMessage {
+                id: id.clone(),
+                origin_bid: self.identity.bid().into(),
+                envelope: bytes,
+                text: text.into(),
+                origin_name: self.identity.document().display_name.clone(),
+                created_at_ms: now_ms,
+                expires_at_ms,
+                outgoing: true,
+            },
+            now_ms,
+        )?;
+        Ok(id)
+    }
+
+    /// Newest-first public feed page (authored and received posts).
+    pub fn feed(&self, limit: u32, offset: u32) -> Result<Vec<blendr_storage::BroadcastMessage>> {
+        if !(1..=500).contains(&limit) {
+            return Err(MessagingError::Policy("feed limit must be 1..=500"));
+        }
+        self.store.broadcast_feed(limit, offset).map_err(Into::into)
     }
 
     /// Decrypt bounded history pages; received plaintext is not persisted.

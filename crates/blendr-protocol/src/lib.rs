@@ -10,12 +10,14 @@
 //! HPKE protects persisted messages independently of the live session. Expiry
 //! policy is deliberately a caller responsibility so old history stays readable.
 
+mod broadcast;
 mod codec;
 mod envelope;
 mod session;
 #[cfg(test)]
 mod tests;
 
+pub use broadcast::{BroadcastEnvelope, seal_broadcast};
 pub use envelope::{Envelope, EnvelopeMetadata, Receipt, ReceiptKind, open_message, seal_message};
 pub use session::{SecureSession, authenticate};
 
@@ -90,6 +92,10 @@ pub struct Capabilities {
     pub max_bytes: u32,
     pub link_receipt: bool,
     pub destination_receipt: bool,
+    /// This node publishes and accepts public broadcast envelopes.
+    pub broadcast_enabled: bool,
+    /// Largest broadcast ID inventory advertised per sync direction.
+    pub inventory_max_ids: u32,
 }
 impl Capabilities {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -101,13 +107,15 @@ impl Capabilities {
             || self.max_messages > 10_000
             || self.max_bytes == 0
             || self.max_bytes > 1024 * 1024 * 1024
+            || self.inventory_max_ids == 0
+            || self.inventory_max_ids > 4096
         {
             return Err(Error::Limit);
         }
         Ok(())
     }
     pub(crate) fn write(&self, w: &mut Writer) {
-        w.array(10);
+        w.array(12);
         w.text("blendr:direct");
         w.uint(1);
         w.text("bis:1");
@@ -118,9 +126,11 @@ impl Capabilities {
         w.uint(self.max_bytes.into());
         w.boolean(self.link_receipt);
         w.boolean(self.destination_receipt);
+        w.boolean(self.broadcast_enabled);
+        w.uint(self.inventory_max_ids.into());
     }
     pub(crate) fn read(r: &mut Reader<'_>) -> Result<Self> {
-        r.array(10)?;
+        r.array(12)?;
         r.literal("blendr:direct")?;
         if r.uint()? != 1 {
             return Err(Error::Unsupported);
@@ -134,6 +144,8 @@ impl Capabilities {
             max_bytes: r.u32()?,
             link_receipt: r.boolean()?,
             destination_receipt: r.boolean()?,
+            broadcast_enabled: r.boolean()?,
+            inventory_max_ids: r.u32()?,
         };
         c.validate()?;
         Ok(c)
@@ -150,13 +162,50 @@ pub struct SessionOptions {
 /// No payload-bearing Debug implementation: frame contents must not enter logs.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// Encoded direct `Envelope`.
     Message(Vec<u8>),
     LinkAck(Receipt),
     DestinationReceipt(Receipt),
     TurnEnd,
     Goodbye,
+    /// Broadcast sync: advertised `BroadcastEnvelope` message IDs, oldest first.
+    Inventory(Vec<String>),
+    /// Broadcast sync: the subset of offered IDs the receiver wants.
+    SyncRequest(Vec<String>),
+    /// Broadcast sync: encoded `BroadcastEnvelope` payload.
+    BroadcastMessage(Vec<u8>),
+    /// Broadcast sync: IDs durably persisted by the receiver (unsigned link ack).
+    BroadcastAck(Vec<String>),
+    /// End of one broadcast sync direction.
+    SyncEnd,
 }
 impl Frame {
+    /// Hard bound for ID-list frames (Inventory/SyncRequest/BroadcastAck).
+    pub(crate) const MAX_ID_LIST: usize = 4096;
+
+    fn encode_id_list(w: &mut Writer, ids: &[String], tag: u64) -> Result<()> {
+        if ids.len() > Self::MAX_ID_LIST {
+            return Err(Error::Limit);
+        }
+        w.array(3);
+        w.uint(1);
+        w.uint(tag);
+        w.array(ids.len() as u64);
+        for id in ids {
+            w.text(id);
+        }
+        Ok(())
+    }
+
+    fn decode_id_list(r: &mut Reader<'_>, count: u64) -> Result<Vec<String>> {
+        let count = usize::try_from(count).map_err(|_| Error::Limit)?;
+        let mut ids = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            ids.push(r.text(64)?.to_owned());
+        }
+        Ok(ids)
+    }
+
     pub(crate) fn encode(&self, max: usize) -> Result<Vec<u8>> {
         let mut w = Writer::new();
         match self {
@@ -184,10 +233,26 @@ impl Frame {
                 w.uint(if expected == ReceiptKind::Link { 1 } else { 2 });
                 r.write(&mut w);
             }
-            Self::TurnEnd | Self::Goodbye => {
+            Self::TurnEnd | Self::Goodbye | Self::SyncEnd => {
                 w.array(2);
                 w.uint(1);
-                w.uint(if matches!(self, Self::TurnEnd) { 3 } else { 4 });
+                w.uint(match self {
+                    Self::TurnEnd => 3,
+                    Self::Goodbye => 4,
+                    _ => 9,
+                });
+            }
+            Self::Inventory(ids) => Self::encode_id_list(&mut w, ids, 5)?,
+            Self::SyncRequest(ids) => Self::encode_id_list(&mut w, ids, 6)?,
+            Self::BroadcastAck(ids) => Self::encode_id_list(&mut w, ids, 8)?,
+            Self::BroadcastMessage(bytes) => {
+                if bytes.len() > max.saturating_sub(6) {
+                    return Err(Error::Limit);
+                }
+                w.array(3);
+                w.uint(1);
+                w.uint(7);
+                w.bytes(bytes);
             }
         }
         let bytes = w.finish();
@@ -204,7 +269,8 @@ impl Frame {
         if r.uint()? != 1 {
             return Err(Error::Unsupported);
         }
-        let frame = match (r.uint()?, control) {
+        let tag = r.uint()?;
+        let frame = match (tag, control) {
             (0, false) => Self::Message(r.bytes(max)?.to_vec()),
             (1, false) => {
                 let v = Receipt::read(&mut r)?;
@@ -222,6 +288,20 @@ impl Frame {
             }
             (3, true) => Self::TurnEnd,
             (4, true) => Self::Goodbye,
+            (5, false) => {
+                let count = r.array_len(Self::MAX_ID_LIST as u64)?;
+                Self::Inventory(Self::decode_id_list(&mut r, count)?)
+            }
+            (6, false) => {
+                let count = r.array_len(Self::MAX_ID_LIST as u64)?;
+                Self::SyncRequest(Self::decode_id_list(&mut r, count)?)
+            }
+            (7, false) => Self::BroadcastMessage(r.bytes(max)?.to_vec()),
+            (8, false) => {
+                let count = r.array_len(Self::MAX_ID_LIST as u64)?;
+                Self::BroadcastAck(Self::decode_id_list(&mut r, count)?)
+            }
+            (9, true) => Self::SyncEnd,
             _ => return Err(Error::Unsupported),
         };
         r.finish()?;

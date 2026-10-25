@@ -37,20 +37,24 @@ pub struct EnvelopeMetadata {
     pub max_jumps: u8,
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok_and(|u| {
         u.get_version_num() == 4
             && u.get_variant() == uuid::Variant::RFC4122
             && u.hyphenated().to_string() == id
     })
 }
-fn valid_bid(bid: &str) -> bool {
+pub(crate) fn valid_bid(bid: &str) -> bool {
     bid.len() == 52
         && data_encoding::BASE32_NOPAD
             .decode(bid.as_bytes())
             .is_ok_and(|v| v.len() == 32 && data_encoding::BASE32_NOPAD.encode(&v) == bid)
 }
-fn verify_signature(doc: &IdentityDocument, payload: &[u8], signature: &[u8; 64]) -> Result<()> {
+pub(crate) fn verify_signature(
+    doc: &IdentityDocument,
+    payload: &[u8],
+    signature: &[u8; 64],
+) -> Result<()> {
     VerifyingKey::from_bytes(&doc.signing_public_key)
         .map_err(|_| Error::Authentication)?
         .verify_strict(payload, &Signature::from_bytes(signature))

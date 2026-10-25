@@ -34,7 +34,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+mod broadcast;
 mod direct;
+pub use broadcast::BroadcastMessage;
 pub use direct::{
     DirectMessage, MAX_DIRECT_ENVELOPE_BYTES, MAX_DIRECT_TEXT_BYTES, Peer, ReceiptKind,
     StoredReceipt, TrustStatus,

@@ -93,6 +93,15 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+    /// Read a definite-length array header, rejecting indefinite form and
+    /// counts above `max` before any element is consumed.
+    pub fn array_len(&mut self, max: u64) -> Result<u64> {
+        let n = self.head(4)?;
+        if n > max {
+            return Err(Error::Limit);
+        }
+        Ok(n)
+    }
     pub fn uint(&mut self) -> Result<u64> {
         self.head(0)
     }

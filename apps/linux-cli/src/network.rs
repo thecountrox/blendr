@@ -421,6 +421,91 @@ pub(crate) fn send(
     }
 }
 
+/// Sign and store a public post; with `--sync`, run the node until any peer
+/// acknowledges it durably or the deadline passes. Unlike `send`, publication
+/// is opportunistic: timeout leaves the post stored for later sessions.
+pub(crate) fn publish(cli: &Cli, text: &str, sync: bool, timeout_seconds: u64) -> Result<(), Fail> {
+    let (config, mut node) = open_messaging(cli)?;
+    let id = node
+        .publish(text, blendr_messaging::now_ms().map_err(messaging_fail)?)
+        .map_err(messaging_fail)?;
+    println!("published {id}");
+    if !sync {
+        return Ok(());
+    }
+    node.settings().validate_network().map_err(messaging_fail)?;
+    env_logger::init_from_env(
+        env_logger::Env::default().default_filter_or("off,blendr_bluez=warn"),
+    );
+    let mut synced = false;
+    let end = runtime_on(transport_session(
+        &config,
+        &mut node,
+        Some(Duration::from_secs(timeout_seconds)),
+        None,
+        Some(format!("sharing post {id} ({timeout_seconds}s)")),
+        &mut |_, exchanges| {
+            if exchanges >= 1 {
+                synced = true;
+                true
+            } else {
+                false
+            }
+        },
+    ))?;
+    if synced {
+        println!("post {id} shared in one exchange");
+        return Ok(());
+    }
+    match end {
+        LoopEnd::Deadline => Err(runtime(format!(
+            "no peer session completed within the deadline; post {id} stays published for the next exchange"
+        ))),
+        LoopEnd::Closed(what) => Err(runtime(format!("sync stopped early: {what}"))),
+        LoopEnd::Finished | LoopEnd::Interrupted => Err(runtime(format!(
+            "sync incomplete; post {id} stays published"
+        ))),
+    }
+}
+
+/// Print the public feed, newest first: authored posts and posts received
+/// from authenticated peers alike.
+pub(crate) fn feed(cli: &Cli, search: Option<&str>, limit: u32) -> Result<(), Fail> {
+    let (_, node) = open_messaging(cli)?;
+    let posts = node.feed(limit, 0).map_err(messaging_fail)?;
+    let mut shown = 0u32;
+    for post in posts {
+        if let Some(query) = search
+            && !literal_match(&post.text, query)
+            && !literal_match(&post.origin_name, query)
+        {
+            continue;
+        }
+        let direction = if post.outgoing {
+            "you"
+        } else {
+            &post.origin_name
+        };
+        println!("{}  {:<12}  {}", post.created_at_ms, direction, post.text);
+        shown += 1;
+    }
+    if shown == 0 {
+        match search {
+            Some(q) => println!("no posts matching `{q}`"),
+            None => println!("no posts; publish one or sync with a peer"),
+        }
+    }
+    Ok(())
+}
+
+fn literal_match(text: &str, query: &str) -> bool {
+    query.is_empty()
+        || text
+            .as_bytes()
+            .windows(query.len())
+            .any(|window| window.eq_ignore_ascii_case(query.as_bytes()))
+}
+
 /// Notes and decrypted direct history merge into one newest-first page.
 /// `--peer` restricts to direct messages with that BID; `--direct` drops the
 /// local notes. Received messages decrypt on read only — ciphertext stays at
