@@ -382,10 +382,10 @@ operation with the original daemon configuration.
 - Config changes require editing `config.json`; display-name changes must go
   through `blendr identity rename` or commands refuse with a drift error.
   Secure sessions require `transport.ble.max_frame_payload_bytes >= 1024`.
-- Direct messaging has run Pi↔laptop once under the documented MIDI-plugin
-  isolation (AGENTS.md); broadcast sync is verified by in-memory tests
-  only so far, and the known BlueZ/controller failure modes above still
-  apply to the real adapter.
+- Direct messaging and one-hop broadcast sync have each run Pi↔laptop
+  under the documented MIDI-plugin isolation (see AGENTS.md); the known
+  BlueZ/controller failure modes above still apply, and multi-hop `mesh`
+  forwarding is unimplemented.
 - Identity import never replaces an existing identity; deleting a keystore
   or database to start over is an explicit, manual operation.
 - If none of `busctl`/`dbus-send`/`bluetoothctl` exist, doctor's daemon and

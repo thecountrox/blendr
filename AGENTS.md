@@ -582,3 +582,37 @@ with an empty `Inventory` on BlueZ or with concurrent direct+sync traffic on
 a shared radio. `SyncRequest`/`BroadcastAck` use `UUIDv4` text IDs in CBOR
 arrays; this stays under the negotiated frame bounds because
 `inventory_max_ids` caps them.
+
+### First real-hardware broadcast sync (2026-10-25)
+
+With the Phase 4 code deployed to `/home/pi/blendr` (`git stash push -u` of
+its prior uncommitted tree, `git reset --hard origin/main` = `150ec44`,
+fresh `cargo build -p blendr-cli`), the laptop and Pi completed
+bidirectional broadcast sync and direct messaging over hci0 ↔ hci0 under
+the same documented temporary Pi MIDI-plugin isolation
+(`90-blendr-phase4.conf`, removed afterward):
+
+- Pi `publish` + `start --once` (PID-side); laptop `publish --sync
+  --timeout 90`: single Noise XX exchange, laptop report
+  `broadcast_sent=2 broadcast_received=1`, Pi report
+  `broadcast_sent=1 broadcast_received=2`. Laptop's two posts were its new
+  trial post plus the earlier "hello nearby nodes" smoke post — both
+  crossed over.
+- `feed` on both hosts confirms each received post with correct direction
+  attribution (`alice`/`tvpi` on the peer side, `you` local), proving
+  signed `BroadcastEnvelope` transfer, verification, and durable storage.
+- Same session's laptop `send --to <pi-bid>` delivered
+  `sent=1 destination_receipts=1 … [delivered]`; Pi `inbox --direct`
+  shows `direct <- …  direct phase-4 check` (ciphertext at rest).
+- Idempotency on hardware: the direct-send exchange (second session) ran
+  with `broadcast_sent=0 broadcast_received=0` on both reports — the
+  ledger-suppressed re-offer path works on real BLE, not just memory.
+- The Pi's redundant concurrent dial again lost election cleanly
+  (`link to peer already exists`, `le-connection-abort-by-local`
+  warning); the elected link carried both exchanges.
+- Restoration verified: drop-in removed, `bluetoothd` active with original
+  ExecStart (no `--noplugin`), no blendr processes, and on both hosts
+  `Powered=yes Discovering=no` with `ActiveInstances=0` on the laptop.
+
+All broadcasts moved exactly one hop under `features.broadcast_mode=true`
+on both nodes; `mesh` forwarding remains unimplemented.
